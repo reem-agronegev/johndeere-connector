@@ -30,7 +30,7 @@ const AUTHORIZATION_ENDPOINT = "https://signin.johndeere.com/oauth2/aus78tnlaysM
 // Entry point for the Platform API. Everything else is discovered from `links`.
 const API_ROOT = "https://api.deere.com/platform";
 
-const SCOPES = "ag1 ag2 org1 org2 offline_access";
+const SCOPES = "ag1 ag2 ag3 eq1 eq2 org1 org2 offline_access";
 const DEERE_ACCEPT_HEADER = "application/vnd.deere.axiom.v3+json";
 
 // ---- Database setup --------------------------------------------------
