@@ -30,9 +30,14 @@ const AUTHORIZATION_ENDPOINT = "https://signin.johndeere.com/oauth2/aus78tnlaysM
 // Entry point for the Platform API. Everything else is discovered from `links`.
 const API_ROOT = "https://api.deere.com/platform";
 
-// work1/work2 and files are deliberately left out until Deere approves those
-// APIs — requesting an unapproved scope fails the whole authorization.
-const SCOPES = "ag1 ag2 ag3 eq1 eq2 org1 org2 offline_access";
+// READ-ONLY BY DESIGN.
+// Deere's scopes come in pairs per domain: the lower number grants read, the
+// higher adds write. We deliberately request only the read level, so the token
+// itself is incapable of modifying a grower's data — even if that grower grants
+// a "Manage" (level 3) permission at connections.deere.com.
+// work1/work2 and files are left out until Deere approves those APIs;
+// requesting an unapproved scope fails the whole authorization.
+const SCOPES = "ag1 eq1 org1 offline_access";
 const DEERE_ACCEPT_HEADER = "application/vnd.deere.axiom.v3+json";
 
 // ---- Database setup --------------------------------------------------
@@ -93,6 +98,28 @@ function deereHeaders(accessToken) {
   };
 }
 
+// ---- Read-only guard ----------------------------------------------------
+// Belt and braces alongside the read-only scopes: a dedicated axios instance
+// that refuses to send anything except GET to Deere. If someone later adds a
+// POST/PUT/DELETE by accident, it fails here rather than changing a grower's
+// data. All Deere calls in this file go through deereGet().
+const deereClient = axios.create();
+
+deereClient.interceptors.request.use((config) => {
+  const method = (config.method || "get").toLowerCase();
+  if (method !== "get") {
+    throw new Error(
+      `Blocked a ${method.toUpperCase()} request to ${config.url}. ` +
+        `This connector is read-only and must never modify grower data.`
+    );
+  }
+  return config;
+});
+
+async function deereGet(url, accessToken) {
+  return deereClient.get(url, { headers: deereHeaders(accessToken) });
+}
+
 // ---- Step A: Kick off the flow -------------------------------------------
 app.get("/auth/deere/start", (req, res) => {
   const state = generateRandomState(); // TODO: store & verify this (CSRF protection)
@@ -137,9 +164,7 @@ app.get("/auth/deere/callback", async (req, res) => {
     // Try to resolve which organization this token belongs to, right away.
     let org = null;
     try {
-      const orgsResponse = await axios.get(`${API_ROOT}/organizations`, {
-        headers: deereHeaders(access_token),
-      });
+      const orgsResponse = await deereGet(`${API_ROOT}/organizations`, access_token);
       org = orgsResponse.data.values?.[0] || null;
       if (org) console.log(`Connected organization: ${org.name} (${org.id})`);
     } catch (orgErr) {
@@ -243,9 +268,7 @@ async function findTokenForOrg(orgId) {
   for (const row of candidates.rows) {
     try {
       const accessToken = await getValidAccessToken(row);
-      const orgsResponse = await axios.get(`${API_ROOT}/organizations`, {
-        headers: deereHeaders(accessToken),
-      });
+      const orgsResponse = await deereGet(`${API_ROOT}/organizations`, accessToken);
 
       const match = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
       if (match) {
@@ -278,9 +301,7 @@ app.get("/api/organizations", async (req, res) => {
     for (const tokenRow of rows) {
       try {
         const accessToken = await getValidAccessToken(tokenRow);
-        const orgsResponse = await axios.get(`${API_ROOT}/organizations`, {
-          headers: deereHeaders(accessToken),
-        });
+        const orgsResponse = await deereGet(`${API_ROOT}/organizations`, accessToken);
         for (const org of orgsResponse.data.values || []) {
           if (!seen.has(org.id)) seen.set(org.id, org);
         }
@@ -313,9 +334,7 @@ app.get("/api/boundaries/:orgId", async (req, res) => {
 
     // Re-fetch the org so we get a fresh `links` array reflecting current
     // permissions, rather than assuming the URL shape.
-    const orgsResponse = await axios.get(`${API_ROOT}/organizations`, {
-      headers: deereHeaders(accessToken),
-    });
+    const orgsResponse = await deereGet(`${API_ROOT}/organizations`, accessToken);
     const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
 
     if (!org) {
@@ -332,9 +351,7 @@ app.get("/api/boundaries/:orgId", async (req, res) => {
       });
     }
 
-    const boundariesResponse = await axios.get(boundariesUri, {
-      headers: deereHeaders(accessToken),
-    });
+    const boundariesResponse = await deereGet(boundariesUri, accessToken);
 
     res.json({
       organization: { id: org.id, name: org.name },
@@ -363,9 +380,7 @@ app.get("/api/fields/:orgId", async (req, res) => {
 
     const accessToken = await getValidAccessToken(found.row);
 
-    const orgsResponse = await axios.get(`${API_ROOT}/organizations`, {
-      headers: deereHeaders(accessToken),
-    });
+    const orgsResponse = await deereGet(`${API_ROOT}/organizations`, accessToken);
     const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
     if (!org) return res.status(404).json({ message: "Organization not visible with this token." });
 
@@ -377,7 +392,7 @@ app.get("/api/fields/:orgId", async (req, res) => {
       });
     }
 
-    const fieldsResponse = await axios.get(fieldsUri, { headers: deereHeaders(accessToken) });
+    const fieldsResponse = await deereGet(fieldsUri, accessToken);
 
     res.json({
       organization: { id: org.id, name: org.name },
