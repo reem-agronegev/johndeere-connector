@@ -72,10 +72,13 @@ async function ensureTableExists() {
       AND a.organization_id = b.organization_id
       AND a.id < b.id;
   `);
-  // Needed for ON CONFLICT (organization_id) to work. Partial index so that
-  // multiple rows with a NULL org (not yet resolved) are still allowed.
+// Drop first: IF NOT EXISTS only checks the index NAME, so a partial or
+  // non-unique index left over from an earlier run would silently block
+  // creation of the real one, and ON CONFLICT would keep failing.
+  await pool.query(`DROP INDEX IF EXISTS deere_tokens_org_unique;`);
+
   await pool.query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS deere_tokens_org_unique
+    CREATE UNIQUE INDEX deere_tokens_org_unique
     ON deere_tokens (organization_id)
     WHERE organization_id IS NOT NULL;
   `);
