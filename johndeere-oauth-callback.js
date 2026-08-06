@@ -317,93 +317,239 @@ app.get("/api/organizations", async (req, res) => {
   }
 });
 
-// ---- GET /api/boundaries/:orgId --------------------------------------
-// Uses link traversal: fetches the org, reads its `boundaries` link, follows it.
-app.get("/api/boundaries/:orgId", async (req, res) => {
-  const { orgId } = req.params;
+// ---- Shared helper: fetch a linked collection off an organization --------
+// Every data endpoint below follows the same shape: resolve a token, re-fetch
+// the org to get a fresh `links` array, find the relevant link, follow it.
+// Re-fetching matters — the links reflect what this token+grower combination
+// can actually reach right now, so we never hand-build a URL and guess.
+async function fetchOrgCollection({ orgId, rel, res, resultKey, missingHint }) {
+  const found = await findTokenForOrg(orgId);
+  if (!found) {
+    return res.status(404).json({ message: "No stored token grants access to this organization." });
+  }
 
-  try {
-    const found = await findTokenForOrg(orgId);
-    if (!found) {
-      return res.status(404).json({
-        message: "No stored token grants access to this organization.",
-      });
-    }
+  const accessToken = await getValidAccessToken(found.row);
 
-    const accessToken = await getValidAccessToken(found.row);
+  const orgsResponse = await deereGet(`${API_ROOT}/organizations`, accessToken);
+  const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
+  if (!org) {
+    return res.status(404).json({ message: "Organization not visible with this token." });
+  }
 
-    // Re-fetch the org so we get a fresh `links` array reflecting current
-    // permissions, rather than assuming the URL shape.
-    const orgsResponse = await deereGet(`${API_ROOT}/organizations`, accessToken);
-    const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
-
-    if (!org) {
-      return res.status(404).json({ message: "Organization not visible with this token." });
-    }
-
-    const boundariesUri = findLink(org, "boundaries");
-    if (!boundariesUri) {
-      return res.status(403).json({
-        message:
-          "This organization has not shared boundary data with the application. " +
-          "Ask the grower to raise the Locations permission at connections.deere.com.",
-        availableLinks: (org.links || []).map((l) => l.rel),
-      });
-    }
-
-    const boundariesResponse = await deereGet(boundariesUri, accessToken);
-
-    res.json({
-      organization: { id: org.id, name: org.name },
-      total: boundariesResponse.data.total,
-      boundaries: boundariesResponse.data.values || [],
-    });
-  } catch (err) {
-    console.error("Failed to fetch boundaries:", err.response?.data || err.message);
-    res.status(500).json({
-      error: "Failed to fetch boundaries.",
-      detail: err.response?.data || err.message,
+  const uri = findLink(org, rel);
+  if (!uri) {
+    return res.status(403).json({
+      message: `This organization has not shared "${rel}" with the application.`,
+      hint: missingHint,
+      availableLinks: (org.links || []).map((l) => l.rel),
     });
   }
-});
+
+  const response = await deereGet(uri, accessToken);
+
+  return res.json({
+    organization: { id: org.id, name: org.name },
+    source: uri,
+    total: response.data.total,
+    [resultKey]: response.data.values || response.data,
+  });
+}
+
+// Wraps an endpoint so a failure reports Deere's own error rather than a
+// generic 500 — the status code and body are what tell us whether a
+// permission is missing versus something else being wrong.
+function handleDeereRoute(label, handler) {
+  return async (req, res) => {
+    try {
+      await handler(req, res);
+    } catch (err) {
+      const status = err.response?.status;
+      console.error(`Failed to fetch ${label}:`, status, err.response?.data || err.message);
+      res.status(500).json({
+        error: `Failed to fetch ${label}.`,
+        deereStatus: status || null,
+        detail: err.response?.data || err.message,
+      });
+    }
+  };
+}
+
+// ---- GET /api/boundaries/:orgId --------------------------------------
+app.get(
+  "/api/boundaries/:orgId",
+  handleDeereRoute("boundaries", (req, res) =>
+    fetchOrgCollection({
+      orgId: req.params.orgId,
+      rel: "boundaries",
+      res,
+      resultKey: "boundaries",
+      missingHint: "Ask the grower to raise the Locations permission at connections.deere.com.",
+    })
+  )
+);
 
 // ---- GET /api/fields/:orgId ------------------------------------------
-// Same pattern, for the field list (useful for mapping to dim_polygon).
-app.get("/api/fields/:orgId", async (req, res) => {
-  const { orgId } = req.params;
+app.get(
+  "/api/fields/:orgId",
+  handleDeereRoute("fields", (req, res) =>
+    fetchOrgCollection({
+      orgId: req.params.orgId,
+      rel: "fields",
+      res,
+      resultKey: "fields",
+      missingHint: "Ask the grower to raise the Locations permission at connections.deere.com.",
+    })
+  )
+);
 
-  try {
+// ---- GET /api/field-operations/:orgId --------------------------------
+// Planting, spraying, tillage, harvest. This is the one that feeds fact_ops
+// and fact_yield. Expected to be blocked while the grower's Work permission
+// is at level 0 and work1/work2 scopes are unapproved — the error body will
+// say so explicitly rather than failing silently.
+app.get(
+  "/api/field-operations/:orgId",
+  handleDeereRoute("field operations", (req, res) =>
+    fetchOrgCollection({
+      orgId: req.params.orgId,
+      rel: "fieldOperation",
+      res,
+      resultKey: "fieldOperations",
+      missingHint:
+        "Field operations sit under the Work permission. The grower must raise it " +
+        "above 0 at connections.deere.com, and the app needs work1/work2 scopes approved by Deere.",
+    })
+  )
+);
+
+// ---- GET /api/machines/:orgId ----------------------------------------
+// Equipment list for the organization.
+app.get(
+  "/api/machines/:orgId",
+  handleDeereRoute("machines", (req, res) =>
+    fetchOrgCollection({
+      orgId: req.params.orgId,
+      rel: "machines",
+      res,
+      resultKey: "machines",
+      missingHint: "Ask the grower to raise the Equipment permission at connections.deere.com.",
+    })
+  )
+);
+
+// ---- GET /api/files/:orgId -------------------------------------------
+app.get(
+  "/api/files/:orgId",
+  handleDeereRoute("files", (req, res) =>
+    fetchOrgCollection({
+      orgId: req.params.orgId,
+      rel: "files",
+      res,
+      resultKey: "files",
+      missingHint: "The Files API is still pending approval from Deere for this application.",
+    })
+  )
+);
+
+// ---- GET /api/assets/:orgId ------------------------------------------
+app.get(
+  "/api/assets/:orgId",
+  handleDeereRoute("assets", (req, res) =>
+    fetchOrgCollection({
+      orgId: req.params.orgId,
+      rel: "assets",
+      res,
+      resultKey: "assets",
+      missingHint: "Ask the grower to raise the Equipment permission at connections.deere.com.",
+    })
+  )
+);
+
+// ---- GET /api/machine/:machineId/hours -------------------------------
+// Engine hours for a single machine. Machine IDs come from /api/machines.
+// Deere's docs are explicit that resource IDs should be read from a response
+// immediately before use rather than stored, since access can change.
+app.get(
+  "/api/machine/:orgId/:machineId/hours",
+  handleDeereRoute("machine engine hours", async (req, res) => {
+    const { orgId, machineId } = req.params;
+
     const found = await findTokenForOrg(orgId);
     if (!found) {
       return res.status(404).json({ message: "No stored token grants access to this organization." });
     }
+    const accessToken = await getValidAccessToken(found.row);
 
+    const [engineHours, hoursOfOperation] = await Promise.allSettled([
+      deereGet(`${API_ROOT}/machines/${machineId}/engineHours`, accessToken),
+      deereGet(`${API_ROOT}/machines/${machineId}/hoursOfOperation`, accessToken),
+    ]);
+
+    res.json({
+      machineId,
+      engineHours:
+        engineHours.status === "fulfilled"
+          ? engineHours.value.data
+          : { error: engineHours.reason.response?.data || engineHours.reason.message },
+      hoursOfOperation:
+        hoursOfOperation.status === "fulfilled"
+          ? hoursOfOperation.value.data
+          : { error: hoursOfOperation.reason.response?.data || hoursOfOperation.reason.message },
+    });
+  })
+);
+
+// ---- GET /api/diagnostics/:orgId -------------------------------------
+// Tries every collection we care about in one request and reports which ones
+// come back, which are empty, and which are blocked. Useful for checking a
+// newly connected grower without hitting each endpoint by hand.
+app.get(
+  "/api/diagnostics/:orgId",
+  handleDeereRoute("diagnostics", async (req, res) => {
+    const { orgId } = req.params;
+
+    const found = await findTokenForOrg(orgId);
+    if (!found) {
+      return res.status(404).json({ message: "No stored token grants access to this organization." });
+    }
     const accessToken = await getValidAccessToken(found.row);
 
     const orgsResponse = await deereGet(`${API_ROOT}/organizations`, accessToken);
     const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
     if (!org) return res.status(404).json({ message: "Organization not visible with this token." });
 
-    const fieldsUri = findLink(org, "fields");
-    if (!fieldsUri) {
-      return res.status(403).json({
-        message: "This organization has not shared field data with the application.",
-        availableLinks: (org.links || []).map((l) => l.rel),
-      });
-    }
+    const rels = ["fields", "farms", "boundaries", "fieldOperation", "machines", "assets", "files", "clients", "flags"];
+    const report = {};
 
-    const fieldsResponse = await deereGet(fieldsUri, accessToken);
+    for (const rel of rels) {
+      const uri = findLink(org, rel);
+      if (!uri) {
+        report[rel] = { status: "no link — not shared with this application" };
+        continue;
+      }
+      try {
+        const r = await deereGet(uri, accessToken);
+        const total = r.data.total ?? (r.data.values ? r.data.values.length : null);
+        report[rel] = {
+          status: total === 0 ? "reachable but empty" : "reachable",
+          total,
+        };
+      } catch (err) {
+        report[rel] = {
+          status: "blocked",
+          httpStatus: err.response?.status || null,
+          detail: err.response?.data || err.message,
+        };
+      }
+    }
 
     res.json({
       organization: { id: org.id, name: org.name },
-      total: fieldsResponse.data.total,
-      fields: fieldsResponse.data.values || [],
+      scopesRequested: SCOPES,
+      report,
     });
-  } catch (err) {
-    console.error("Failed to fetch fields:", err.response?.data || err.message);
-    res.status(500).json({ error: "Failed to fetch fields.", detail: err.response?.data || err.message });
-  }
-});
+  })
+);
 
 function generateRandomState() {
   return Math.random().toString(36).substring(2, 15);
