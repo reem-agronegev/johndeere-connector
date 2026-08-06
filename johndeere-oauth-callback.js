@@ -1,13 +1,13 @@
 /**
  * John Deere Operations Center - OAuth2 Flow + Data Fetching
  * ---------------------------------------------------------------
- * NEW IN THIS VERSION:
- *   - After a farmer connects, we now call the Organizations API to find
- *     out which organization(s) they connected, and save that org ID
- *     alongside their tokens.
- *   - New endpoints let you actually pull real data:
- *       GET /api/organizations         -> list connected organizations
- *       GET /api/boundaries/:orgId     -> list field boundaries for an org
+ * FIXES IN THIS VERSION:
+ *   1) UPSERT by organization_id  -> no more duplicate rows per org
+ *   2) Link traversal             -> follow the `links` array Deere returns
+ *                                    instead of hand-building URLs (avoids 403s)
+ *   3) Self-healing org lookup    -> if organization_id wasn't saved during the
+ *                                    callback, /api/boundaries finds it live and
+ *                                    backfills the database
  *
  * Requires: npm install express axios dotenv pg
  */
@@ -27,12 +27,10 @@ const REDIRECT_URI = process.env.DEERE_REDIRECT_URI;
 const TOKEN_ENDPOINT = "https://signin.johndeere.com/oauth2/aus78tnlaysMraFhC1t7/v1/token";
 const AUTHORIZATION_ENDPOINT = "https://signin.johndeere.com/oauth2/aus78tnlaysMraFhC1t7/v1/authorize";
 
-// Production data API base. (Sandbox equivalent: https://sandboxapi.deere.com/platform)
-const API_BASE = "https://partnerapi.deere.com/platform";
+// Entry point for the Platform API. Everything else is discovered from `links`.
+const API_ROOT = "https://api.deere.com/platform";
 
 const SCOPES = "ag1 ag2 org1 org2 offline_access";
-
-// John Deere's custom JSON media type, required on most Platform API calls
 const DEERE_ACCEPT_HEADER = "application/vnd.deere.axiom.v3+json";
 
 // ---- Database setup --------------------------------------------------
@@ -54,7 +52,29 @@ async function ensureTableExists() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+
+  // Needed for ON CONFLICT (organization_id) to work. Partial index so that
+  // multiple rows with a NULL org (not yet resolved) are still allowed.
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS deere_tokens_org_unique
+    ON deere_tokens (organization_id)
+    WHERE organization_id IS NOT NULL;
+  `);
+
   console.log("Database ready: deere_tokens table exists.");
+}
+
+// ---- Small helper: pull a URL out of Deere's `links` array ---------------
+function findLink(entity, rel) {
+  const link = (entity.links || []).find((l) => l.rel === rel);
+  return link ? link.uri : null;
+}
+
+function deereHeaders(accessToken) {
+  return {
+    Authorization: `Bearer ${accessToken}`,
+    Accept: DEERE_ACCEPT_HEADER,
+  };
 }
 
 // ---- Step A: Kick off the flow -------------------------------------------
@@ -75,12 +95,8 @@ app.get("/auth/deere/start", (req, res) => {
 app.get("/auth/deere/callback", async (req, res) => {
   const { code, error } = req.query;
 
-  if (error) {
-    return res.status(400).send(`Authorization was not completed: ${error}`);
-  }
-  if (!code) {
-    return res.status(400).send("Missing authorization code.");
-  }
+  if (error) return res.status(400).send(`Authorization was not completed: ${error}`);
+  if (!code) return res.status(400).send("Missing authorization code.");
 
   try {
     const tokenResponse = await axios.post(
@@ -102,39 +118,30 @@ app.get("/auth/deere/callback", async (req, res) => {
     const { access_token, refresh_token, expires_in } = tokenResponse.data;
     const expiresAt = new Date(Date.now() + expires_in * 1000);
 
-    // Save the token first (without an org ID yet)
-    const insertResult = await pool.query(
-      `INSERT INTO deere_tokens (access_token, refresh_token, expires_at)
-       VALUES ($1, $2, $3) RETURNING id`,
-      [access_token, refresh_token, expiresAt]
-    );
-    const tokenRowId = insertResult.rows[0].id;
-
-    // Immediately look up which organization(s) this token grants access to,
-    // and save the first one against this row. (A token can cover multiple
-    // orgs if the farmer connected more than one; for simplicity we store
-    // the first here — you can extend this to store one row per org.)
+    // Try to resolve which organization this token belongs to, right away.
+    let org = null;
     try {
-      const orgsResponse = await axios.get(`${API_BASE}/organizations`, {
-        headers: {
-          Authorization: `Bearer ${access_token}`,
-          Accept: DEERE_ACCEPT_HEADER,
-        },
+      const orgsResponse = await axios.get(`${API_ROOT}/organizations`, {
+        headers: deereHeaders(access_token),
       });
-
-      const firstOrg = orgsResponse.data.values?.[0];
-      if (firstOrg) {
-        await pool.query(
-          `UPDATE deere_tokens SET organization_id = $1, organization_name = $2 WHERE id = $3`,
-          [firstOrg.id, firstOrg.name, tokenRowId]
-        );
-        console.log(`Connected organization: ${firstOrg.name} (${firstOrg.id})`);
-      }
+      org = orgsResponse.data.values?.[0] || null;
+      if (org) console.log(`Connected organization: ${org.name} (${org.id})`);
     } catch (orgErr) {
-      // Don't fail the whole connection just because this lookup failed —
-      // the tokens are already safely saved either way.
-      console.error("Could not fetch organization info:", orgErr.response?.data || orgErr.message);
+      // Non-fatal: the token is still worth saving, and /api/boundaries will
+      // backfill the organization later.
+      console.error(
+        "Could not resolve organization during callback:",
+        orgErr.response?.data || orgErr.message
+      );
     }
+
+    await saveToken({
+      organizationId: org?.id || null,
+      organizationName: org?.name || null,
+      accessToken: access_token,
+      refreshToken: refresh_token,
+      expiresAt,
+    });
 
     console.log("Tokens saved to database. Expires at:", expiresAt);
     res.send("Connection successful! You can close this window.");
@@ -144,13 +151,35 @@ app.get("/auth/deere/callback", async (req, res) => {
   }
 });
 
-// ---- Helper: get a valid (non-expired) access token, refreshing if needed
-async function getValidAccessToken(tokenRow) {
-  const now = new Date();
-  const bufferMs = 60 * 1000; // refresh 1 minute before actual expiry
+// ---- Save or update a token row (UPSERT by organization_id) --------------
+async function saveToken({ organizationId, organizationName, accessToken, refreshToken, expiresAt }) {
+  if (organizationId) {
+    await pool.query(
+      `INSERT INTO deere_tokens
+         (organization_id, organization_name, access_token, refresh_token, expires_at)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (organization_id) DO UPDATE SET
+         organization_name = EXCLUDED.organization_name,
+         access_token      = EXCLUDED.access_token,
+         refresh_token     = EXCLUDED.refresh_token,
+         expires_at        = EXCLUDED.expires_at,
+         updated_at        = NOW()`,
+      [organizationId, organizationName, accessToken, refreshToken, expiresAt]
+    );
+  } else {
+    await pool.query(
+      `INSERT INTO deere_tokens (access_token, refresh_token, expires_at)
+       VALUES ($1, $2, $3)`,
+      [accessToken, refreshToken, expiresAt]
+    );
+  }
+}
 
-  if (new Date(tokenRow.expires_at).getTime() - bufferMs > now.getTime()) {
-    return tokenRow.access_token; // still valid
+// ---- Refresh an expired access token -------------------------------------
+async function getValidAccessToken(tokenRow) {
+  const bufferMs = 60 * 1000;
+  if (new Date(tokenRow.expires_at).getTime() - bufferMs > Date.now()) {
+    return tokenRow.access_token;
   }
 
   console.log("Access token expired, refreshing...");
@@ -172,77 +201,179 @@ async function getValidAccessToken(tokenRow) {
   const expiresAt = new Date(Date.now() + expires_in * 1000);
 
   await pool.query(
-    `UPDATE deere_tokens SET access_token = $1, refresh_token = $2, expires_at = $3, updated_at = NOW() WHERE id = $4`,
+    `UPDATE deere_tokens
+     SET access_token = $1, refresh_token = $2, expires_at = $3, updated_at = NOW()
+     WHERE id = $4`,
     [access_token, refresh_token, expiresAt, tokenRow.id]
   );
 
   return access_token;
 }
 
-// ---- NEW: GET /api/organizations ------------------------------------
-// Returns the list of organizations connected so far (from our database),
-// re-fetching live data from John Deere for each using their saved token.
+// ---- Find a usable token for a given organization ------------------------
+// Tries the database first. If no row is tagged with this org, falls back to
+// checking every stored token against Deere, and backfills the match.
+async function findTokenForOrg(orgId) {
+  const tagged = await pool.query(
+    `SELECT * FROM deere_tokens WHERE organization_id = $1 ORDER BY updated_at DESC LIMIT 1`,
+    [orgId]
+  );
+  if (tagged.rows.length > 0) {
+    return { row: tagged.rows[0], org: null };
+  }
+
+  // Backfill path: look through untagged tokens for one that can see this org.
+  const candidates = await pool.query(
+    `SELECT * FROM deere_tokens WHERE organization_id IS NULL ORDER BY created_at DESC`
+  );
+
+  for (const row of candidates.rows) {
+    try {
+      const accessToken = await getValidAccessToken(row);
+      const orgsResponse = await axios.get(`${API_ROOT}/organizations`, {
+        headers: deereHeaders(accessToken),
+      });
+
+      const match = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
+      if (match) {
+        await pool.query(
+          `UPDATE deere_tokens SET organization_id = $1, organization_name = $2, updated_at = NOW()
+           WHERE id = $3`,
+          [match.id, match.name, row.id]
+        );
+        console.log(`Backfilled organization ${match.name} (${match.id}) onto token row ${row.id}`);
+        return { row: { ...row, organization_id: match.id }, org: match };
+      }
+    } catch (err) {
+      console.error(`Token row ${row.id} could not be checked:`, err.response?.data || err.message);
+    }
+  }
+
+  return null;
+}
+
+// ---- GET /api/organizations ------------------------------------------
 app.get("/api/organizations", async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `SELECT * FROM deere_tokens ORDER BY created_at DESC`
-    );
-
+    const { rows } = await pool.query(`SELECT * FROM deere_tokens ORDER BY updated_at DESC`);
     if (rows.length === 0) {
       return res.status(404).json({ message: "No connected organizations yet." });
     }
 
-    const results = [];
+    // Deduplicate by organization id across all stored tokens.
+    const seen = new Map();
     for (const tokenRow of rows) {
-      const accessToken = await getValidAccessToken(tokenRow);
-      const orgsResponse = await axios.get(`${API_BASE}/organizations`, {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: DEERE_ACCEPT_HEADER,
-        },
-      });
-      results.push(...orgsResponse.data.values);
+      try {
+        const accessToken = await getValidAccessToken(tokenRow);
+        const orgsResponse = await axios.get(`${API_ROOT}/organizations`, {
+          headers: deereHeaders(accessToken),
+        });
+        for (const org of orgsResponse.data.values || []) {
+          if (!seen.has(org.id)) seen.set(org.id, org);
+        }
+      } catch (err) {
+        console.error(`Skipping token row ${tokenRow.id}:`, err.response?.data || err.message);
+      }
     }
 
-    res.json(results);
+    res.json([...seen.values()]);
   } catch (err) {
     console.error("Failed to fetch organizations:", err.response?.data || err.message);
     res.status(500).json({ error: "Failed to fetch organizations." });
   }
 });
 
-// ---- NEW: GET /api/boundaries/:orgId ---------------------------------
-// Returns field boundaries for a specific organization.
+// ---- GET /api/boundaries/:orgId --------------------------------------
+// Uses link traversal: fetches the org, reads its `boundaries` link, follows it.
 app.get("/api/boundaries/:orgId", async (req, res) => {
   const { orgId } = req.params;
 
   try {
-    // Find a saved token that has access to this organization
-    const { rows } = await pool.query(
-      `SELECT * FROM deere_tokens WHERE organization_id = $1 ORDER BY created_at DESC LIMIT 1`,
-      [orgId]
-    );
-
-    if (rows.length === 0) {
-      return res.status(404).json({ message: "No saved connection found for this organization." });
+    const found = await findTokenForOrg(orgId);
+    if (!found) {
+      return res.status(404).json({
+        message: "No stored token grants access to this organization.",
+      });
     }
 
-    const accessToken = await getValidAccessToken(rows[0]);
+    const accessToken = await getValidAccessToken(found.row);
 
-    const boundariesResponse = await axios.get(
-      `${API_BASE}/organizations/${orgId}/boundaries`,
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: DEERE_ACCEPT_HEADER,
-        },
-      }
-    );
+    // Re-fetch the org so we get a fresh `links` array reflecting current
+    // permissions, rather than assuming the URL shape.
+    const orgsResponse = await axios.get(`${API_ROOT}/organizations`, {
+      headers: deereHeaders(accessToken),
+    });
+    const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
 
-    res.json(boundariesResponse.data.values || []);
+    if (!org) {
+      return res.status(404).json({ message: "Organization not visible with this token." });
+    }
+
+    const boundariesUri = findLink(org, "boundaries");
+    if (!boundariesUri) {
+      return res.status(403).json({
+        message:
+          "This organization has not shared boundary data with the application. " +
+          "Ask the grower to raise the Locations permission at connections.deere.com.",
+        availableLinks: (org.links || []).map((l) => l.rel),
+      });
+    }
+
+    const boundariesResponse = await axios.get(boundariesUri, {
+      headers: deereHeaders(accessToken),
+    });
+
+    res.json({
+      organization: { id: org.id, name: org.name },
+      total: boundariesResponse.data.total,
+      boundaries: boundariesResponse.data.values || [],
+    });
   } catch (err) {
     console.error("Failed to fetch boundaries:", err.response?.data || err.message);
-    res.status(500).json({ error: "Failed to fetch boundaries." });
+    res.status(500).json({
+      error: "Failed to fetch boundaries.",
+      detail: err.response?.data || err.message,
+    });
+  }
+});
+
+// ---- GET /api/fields/:orgId ------------------------------------------
+// Same pattern, for the field list (useful for mapping to dim_polygon).
+app.get("/api/fields/:orgId", async (req, res) => {
+  const { orgId } = req.params;
+
+  try {
+    const found = await findTokenForOrg(orgId);
+    if (!found) {
+      return res.status(404).json({ message: "No stored token grants access to this organization." });
+    }
+
+    const accessToken = await getValidAccessToken(found.row);
+
+    const orgsResponse = await axios.get(`${API_ROOT}/organizations`, {
+      headers: deereHeaders(accessToken),
+    });
+    const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
+    if (!org) return res.status(404).json({ message: "Organization not visible with this token." });
+
+    const fieldsUri = findLink(org, "fields");
+    if (!fieldsUri) {
+      return res.status(403).json({
+        message: "This organization has not shared field data with the application.",
+        availableLinks: (org.links || []).map((l) => l.rel),
+      });
+    }
+
+    const fieldsResponse = await axios.get(fieldsUri, { headers: deereHeaders(accessToken) });
+
+    res.json({
+      organization: { id: org.id, name: org.name },
+      total: fieldsResponse.data.total,
+      fields: fieldsResponse.data.values || [],
+    });
+  } catch (err) {
+    console.error("Failed to fetch fields:", err.response?.data || err.message);
+    res.status(500).json({ error: "Failed to fetch fields.", detail: err.response?.data || err.message });
   }
 });
 
