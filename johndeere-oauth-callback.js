@@ -53,6 +53,17 @@ async function ensureTableExists() {
     );
   `);
 
+  // CREATE TABLE IF NOT EXISTS silently skips an existing table, so columns
+  // added in later versions of this file won't appear on a database created
+  // by an earlier version. Backfill them explicitly.
+  await pool.query(`
+    ALTER TABLE deere_tokens
+      ADD COLUMN IF NOT EXISTS organization_id TEXT,
+      ADD COLUMN IF NOT EXISTS organization_name TEXT,
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW(),
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+  `);
+
   // Needed for ON CONFLICT (organization_id) to work. Partial index so that
   // multiple rows with a NULL org (not yet resolved) are still allowed.
   await pool.query(`
