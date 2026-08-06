@@ -63,7 +63,15 @@ async function ensureTableExists() {
       ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW(),
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
   `);
-
+// The unique index below can't be created while duplicate organization_id
+  // rows exist (left over from earlier versions). Keep the newest row per org.
+  await pool.query(`
+    DELETE FROM deere_tokens a
+    USING deere_tokens b
+    WHERE a.organization_id IS NOT NULL
+      AND a.organization_id = b.organization_id
+      AND a.id < b.id;
+  `);
   // Needed for ON CONFLICT (organization_id) to work. Partial index so that
   // multiple rows with a NULL org (not yet resolved) are still allowed.
   await pool.query(`
