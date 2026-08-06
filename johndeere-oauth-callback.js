@@ -30,6 +30,8 @@ const AUTHORIZATION_ENDPOINT = "https://signin.johndeere.com/oauth2/aus78tnlaysM
 // Entry point for the Platform API. Everything else is discovered from `links`.
 const API_ROOT = "https://api.deere.com/platform";
 
+// work1/work2 and files are deliberately left out until Deere approves those
+// APIs — requesting an unapproved scope fails the whole authorization.
 const SCOPES = "ag1 ag2 ag3 eq1 eq2 org1 org2 offline_access";
 const DEERE_ACCEPT_HEADER = "application/vnd.deere.axiom.v3+json";
 
@@ -63,24 +65,16 @@ async function ensureTableExists() {
       ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW(),
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
   `);
-// The unique index below can't be created while duplicate organization_id
-  // rows exist (left over from earlier versions). Keep the newest row per org.
+
+  // Clean up duplicate rows per organization left over from earlier versions,
+  // keeping the newest. saveToken() below uses delete-then-insert rather than
+  // ON CONFLICT, so no unique index is required.
   await pool.query(`
     DELETE FROM deere_tokens a
     USING deere_tokens b
     WHERE a.organization_id IS NOT NULL
       AND a.organization_id = b.organization_id
       AND a.id < b.id;
-  `);
-// Drop first: IF NOT EXISTS only checks the index NAME, so a partial or
-  // non-unique index left over from an earlier run would silently block
-  // creation of the real one, and ON CONFLICT would keep failing.
-  await pool.query(`DROP INDEX IF EXISTS deere_tokens_org_unique;`);
-
-  await pool.query(`
-    CREATE UNIQUE INDEX deere_tokens_org_unique
-    ON deere_tokens (organization_id)
-    WHERE organization_id IS NOT NULL;
   `);
 
   console.log("Database ready: deere_tokens table exists.");
@@ -176,16 +170,13 @@ app.get("/auth/deere/callback", async (req, res) => {
 // ---- Save or update a token row (UPSERT by organization_id) --------------
 async function saveToken({ organizationId, organizationName, accessToken, refreshToken, expiresAt }) {
   if (organizationId) {
+    // Delete-then-insert rather than ON CONFLICT: same end result, but it
+    // doesn't depend on a unique index existing on organization_id.
+    await pool.query(`DELETE FROM deere_tokens WHERE organization_id = $1`, [organizationId]);
     await pool.query(
       `INSERT INTO deere_tokens
          (organization_id, organization_name, access_token, refresh_token, expires_at)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (organization_id) DO UPDATE SET
-         organization_name = EXCLUDED.organization_name,
-         access_token      = EXCLUDED.access_token,
-         refresh_token     = EXCLUDED.refresh_token,
-         expires_at        = EXCLUDED.expires_at,
-         updated_at        = NOW()`,
+       VALUES ($1, $2, $3, $4, $5)`,
       [organizationId, organizationName, accessToken, refreshToken, expiresAt]
     );
   } else {
