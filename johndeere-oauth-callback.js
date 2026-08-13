@@ -37,7 +37,7 @@ const API_ROOT = "https://api.deere.com/platform";
 // a "Manage" (level 3) permission at connections.deere.com.
 // work1/work2 and files are left out until Deere approves those APIs;
 // requesting an unapproved scope fails the whole authorization.
-const SCOPES = "ag1 ag2 ag3 eq1 org1 offline_access";
+const SCOPES = "ag1 eq1 org1 offline_access";
 const DEERE_ACCEPT_HEADER = "application/vnd.deere.axiom.v3+json";
 
 // ---- Database setup --------------------------------------------------
@@ -550,6 +550,192 @@ app.get(
     });
   })
 );
+
+// ---- Deere geometry -> GeoJSON ---------------------------------------
+// Deere returns boundaries as multipolygons -> rings -> points {lat, lon}.
+// GeoJSON wants [lon, lat] and a closed ring, so both need converting.
+// Rings marked "interior" are holes and must follow their exterior ring.
+function boundaryToGeoJsonFeature(boundary) {
+  const polygons = [];
+
+  for (const polygon of boundary.multipolygons || []) {
+    const exteriors = [];
+    const interiors = [];
+
+    for (const ring of polygon.rings || []) {
+      const coords = (ring.points || []).map((p) => [p.lon, p.lat]);
+      // Deere doesn't pre-close its rings, so 3 distinct points is the
+      // minimum valid polygon; we close it ourselves below.
+      if (coords.length < 3) continue;
+
+      // GeoJSON requires the ring to be explicitly closed.
+      const first = coords[0];
+      const last = coords[coords.length - 1];
+      if (first[0] !== last[0] || first[1] !== last[1]) coords.push([...first]);
+
+      if (ring.type === "interior") interiors.push(coords);
+      else exteriors.push(coords);
+    }
+
+    // Deere sometimes returns several exterior rings inside one polygon
+    // (separate parcels worked as one unit), so each becomes its own polygon.
+    for (const ext of exteriors) polygons.push([ext, ...interiors]);
+  }
+
+  if (polygons.length === 0) return null;
+
+  // Each entry of `polygons` is already [exterior, ...holes], which is exactly
+  // the shape both Polygon and MultiPolygon coordinates expect.
+  return {
+    type: "Feature",
+    geometry:
+      polygons.length === 1
+        ? { type: "Polygon", coordinates: polygons[0] }
+        : { type: "MultiPolygon", coordinates: polygons },
+    properties: {
+      id: boundary.id,
+      name: boundary.name,
+      areaHa: boundary.area?.valueAsDouble ?? null,
+      workableAreaHa: boundary.workableArea?.valueAsDouble ?? null,
+      active: boundary.active,
+      irrigated: boundary.irrigated,
+      sourceType: boundary.sourceType,
+      createdTime: boundary.createdTime,
+      modifiedTime: boundary.modifiedTime,
+    },
+  };
+}
+
+// ---- GET /api/geojson/:orgId -----------------------------------------
+// Boundaries as a GeoJSON FeatureCollection — paste into geojson.io, load
+// into QGIS, or feed straight to a map library.
+app.get(
+  "/api/geojson/:orgId",
+  handleDeereRoute("boundaries as GeoJSON", async (req, res) => {
+    const { orgId } = req.params;
+    const activeOnly = req.query.active !== "false"; // default: active only
+
+    const found = await findTokenForOrg(orgId);
+    if (!found) {
+      return res.status(404).json({ message: "No stored token grants access to this organization." });
+    }
+    const accessToken = await getValidAccessToken(found.row);
+
+    const orgsResponse = await deereGet(`${API_ROOT}/organizations`, accessToken);
+    const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
+    if (!org) return res.status(404).json({ message: "Organization not visible with this token." });
+
+    const uri = findLink(org, "boundaries");
+    if (!uri) return res.status(403).json({ message: "Boundary data not shared with this application." });
+
+    const response = await deereGet(uri, accessToken);
+    let boundaries = response.data.values || [];
+    if (activeOnly) boundaries = boundaries.filter((b) => b.active);
+
+    const features = boundaries.map(boundaryToGeoJsonFeature).filter(Boolean);
+
+    res.json({
+      type: "FeatureCollection",
+      features,
+      // Not part of the GeoJSON spec, but harmless and useful when eyeballing.
+      metadata: {
+        organization: { id: org.id, name: org.name },
+        returned: features.length,
+        totalFromDeere: response.data.total,
+        activeOnly,
+      },
+    });
+  })
+);
+
+// ---- GET /map/:orgId --------------------------------------------------
+// Internal inspection map. This is a developer tool for sanity-checking the
+// geometry, not a customer-facing product — the real UI belongs in the
+// AgriData app.
+app.get("/map/:orgId", (req, res) => {
+  const orgId = req.params.orgId.replace(/[^0-9]/g, ""); // keep the URL clean
+  res.type("html").send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Field boundaries — org ${orgId}</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
+  #map { height: 100%; }
+  #panel {
+    position: absolute; top: 12px; right: 12px; z-index: 1000;
+    background: #fff; padding: 12px 14px; border-radius: 6px;
+    box-shadow: 0 1px 6px rgba(0,0,0,.3); font-size: 13px; max-width: 260px;
+  }
+  #panel h3 { margin: 0 0 6px; font-size: 14px; }
+  #panel .muted { color: #666; }
+  label { display: block; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <h3>Field boundaries</h3>
+  <div id="status" class="muted">Loading…</div>
+  <label><input type="checkbox" id="showInactive"> Include inactive boundaries</label>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  const orgId = ${JSON.stringify(orgId)};
+  const map = L.map('map');
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 19, attribution: 'Imagery: Esri'
+  }).addTo(map);
+  map.setView([31.4, 34.8], 9);
+
+  let layer = null;
+  const status = document.getElementById('status');
+
+  function load(includeInactive) {
+    status.textContent = 'Loading…';
+    if (layer) { map.removeLayer(layer); layer = null; }
+
+    fetch('/api/geojson/' + orgId + (includeInactive ? '?active=false' : ''))
+      .then(r => r.json())
+      .then(data => {
+        if (!data.features || data.features.length === 0) {
+          status.textContent = 'No boundaries returned.';
+          return;
+        }
+        layer = L.geoJSON(data, {
+          style: f => ({
+            color: f.properties.active ? '#3aa655' : '#c0803a',
+            weight: 2, fillOpacity: 0.25
+          }),
+          onEachFeature: (f, l) => {
+            const p = f.properties;
+            const area = p.areaHa != null ? p.areaHa.toFixed(2) + ' ha' : 'unknown area';
+            l.bindPopup(
+              '<b>' + (p.name || '(unnamed)') + '</b><br>' +
+              area + '<br>' +
+              (p.active ? 'active' : 'inactive') +
+              (p.irrigated ? ' · irrigated' : '') +
+              '<br><span style="color:#666">' + (p.sourceType || '') + '</span>'
+            );
+          }
+        }).addTo(map);
+        map.fitBounds(layer.getBounds(), { padding: [20, 20] });
+        const org = data.metadata && data.metadata.organization;
+        status.innerHTML =
+          (org ? '<b>' + org.name + '</b><br>' : '') +
+          data.features.length + ' of ' + data.metadata.totalFromDeere + ' boundaries shown';
+      })
+      .catch(err => { status.textContent = 'Failed to load: ' + err.message; });
+  }
+
+  document.getElementById('showInactive').addEventListener('change', e => load(e.target.checked));
+  load(false);
+</script>
+</body>
+</html>`);
+});
 
 function generateRandomState() {
   return Math.random().toString(36).substring(2, 15);
