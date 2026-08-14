@@ -37,7 +37,7 @@ const API_ROOT = "https://api.deere.com/platform";
 // a "Manage" (level 3) permission at connections.deere.com.
 // work1/work2 and files are left out until Deere approves those APIs;
 // requesting an unapproved scope fails the whole authorization.
-const SCOPES = "ag1 eq1 org1 offline_access";
+const SCOPES = "ag1 ag2 ag3 eq1 org1 files offline_access";
 const DEERE_ACCEPT_HEADER = "application/vnd.deere.axiom.v3+json";
 
 // ---- Database setup --------------------------------------------------
