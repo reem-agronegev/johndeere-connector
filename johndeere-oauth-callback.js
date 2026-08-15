@@ -737,6 +737,41 @@ app.get("/map/:orgId", (req, res) => {
 </html>`);
 });
 
+// ---- GET /debug/token/:orgId -----------------------------------------
+// TEMPORARY. Returns a live access token so a request can be reproduced in
+// Postman for John Deere support. A token is a bearer credential — anyone
+// with this URL can read the grower's data until it expires.
+//
+// Guarded by DEBUG_TOKEN_KEY: the endpoint 404s unless that env var is set
+// AND matches ?key=... on the request. Remove this route once the support
+// ticket is closed.
+app.get("/debug/token/:orgId", async (req, res) => {
+  const expectedKey = process.env.DEBUG_TOKEN_KEY;
+
+  // Behave as if the route doesn't exist when unconfigured or mis-keyed,
+  // rather than confirming it's here.
+  if (!expectedKey || req.query.key !== expectedKey) {
+    return res.status(404).send("Cannot GET " + req.path);
+  }
+
+  try {
+    const found = await findTokenForOrg(req.params.orgId);
+    if (!found) return res.status(404).json({ message: "No token for that organization." });
+
+    const accessToken = await getValidAccessToken(found.row);
+    res.json({
+      organizationId: req.params.orgId,
+      accessToken,
+      expiresAt: found.row.expires_at,
+      scopesRequestedAtAuth: SCOPES,
+      warning: "Treat as a password. Remove this endpoint when no longer needed.",
+    });
+  } catch (err) {
+    console.error("Debug token lookup failed:", err.message);
+    res.status(500).json({ error: "Lookup failed." });
+  }
+});
+
 function generateRandomState() {
   return Math.random().toString(36).substring(2, 15);
 }
