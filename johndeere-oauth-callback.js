@@ -661,6 +661,130 @@ function summariseMeasurement(data) {
   return summary;
 }
 
+// ---- GET /api/operation-boundary/:orgId/:operationId -----------------
+// Each field operation carries a "boundary" link — the area actually worked
+// in that pass, which is not the same as the field's own boundary. A combine
+// covers what it covers; the harvest we inspected reported 26.8 ha on a field
+// whose registered boundary is a different size.
+//
+// This probes that link and reports whether real geometry comes back, so a
+// per-operation polygon layer can be designed against fact rather than
+// assumption. Returns GeoJSON when geometry is present.
+//
+// READ ONLY.
+app.get(
+  "/api/operation-boundary/:orgId/:operationId",
+  handleDeereRoute("operation boundary", async (req, res) => {
+    const { orgId, operationId } = req.params;
+
+    const found = await findTokenForOrg(orgId);
+    if (!found) {
+      return res.status(404).json({ message: "No stored token grants access to this organization." });
+    }
+    const accessToken = await getValidAccessToken(found.row);
+
+    const opResponse = await deereGet(`${API_ROOT}/fieldOperations/${operationId}`, accessToken);
+    const operation = opResponse.data;
+
+    const boundaryUri =
+      findLink(operation, "boundary") || `${API_ROOT}/fieldOperations/${operationId}/boundary`;
+
+    let boundaryOutcome;
+    let geojson = null;
+
+    try {
+      const r = await deereGet(boundaryUri, accessToken);
+      const data = r.data;
+
+      // The payload may be a boundary object directly, or wrapped in values[].
+      const candidate = data.multipolygons ? data : (data.values || [])[0];
+
+      if (candidate && candidate.multipolygons) {
+        const feature = boundaryToGeoJsonFeature(candidate);
+        geojson = feature ? { type: "FeatureCollection", features: [feature] } : null;
+        boundaryOutcome = {
+          status: "geometry present",
+          areaHa: candidate.area?.valueAsDouble ?? null,
+          ringCount: (candidate.multipolygons || []).reduce((n, p) => n + (p.rings || []).length, 0),
+          pointCount: (candidate.multipolygons || []).reduce(
+            (n, p) => n + (p.rings || []).reduce((m, ring) => m + (ring.points || []).length, 0),
+            0
+          ),
+          centroid: candidate.centroid ?? null,
+        };
+      } else {
+        boundaryOutcome = {
+          status: "no geometry in payload",
+          topLevelKeys: Object.keys(data || {}),
+          total: data?.total ?? null,
+        };
+      }
+    } catch (err) {
+      boundaryOutcome = {
+        status: "error",
+        httpStatus: err.response?.status || null,
+        detail: err.response?.data || err.message,
+      };
+    }
+
+    // The async shapefile export is the other route to per-operation geometry,
+    // and the only known path to sub-field detail. Probe it without following
+    // through, so we learn what the flow looks like.
+    const shapeUri = findLink(operation, "shapeFileAsync");
+    let shapeFileOutcome = { status: "no shapeFileAsync link on this operation" };
+
+    if (shapeUri) {
+      try {
+        const r = await deereClient.get(shapeUri, {
+          headers: { Authorization: `Bearer ${accessToken}`, Accept: DEERE_ACCEPT_HEADER },
+          responseType: "arraybuffer",
+          validateStatus: () => true,
+          maxRedirects: 0,
+        });
+
+        const contentType = r.headers["content-type"] || "(none)";
+        shapeFileOutcome = {
+          uri: shapeUri,
+          httpStatus: r.status,
+          contentType,
+          bytes: r.data ? r.data.length : 0,
+          location: r.headers["location"] || null,
+        };
+
+        if (contentType.includes("json")) {
+          try {
+            shapeFileOutcome.body = JSON.parse(Buffer.from(r.data).toString("utf8"));
+          } catch {
+            /* leave body out if it doesn't parse */
+          }
+        } else if (r.data && r.data.length > 0) {
+          const head = Buffer.from(r.data.slice(0, 4)).toString("hex");
+          shapeFileOutcome.signature = head;
+          shapeFileOutcome.isZip = head.startsWith("504b0304"); // PK.. = zip archive
+        }
+      } catch (err) {
+        shapeFileOutcome = { uri: shapeUri, status: "error", detail: err.message };
+      }
+    }
+
+    res.json({
+      operation: {
+        id: operationId,
+        type: operation.fieldOperationType,
+        cropSeason: operation.cropSeason,
+        startDate: operation.startDate,
+      },
+      fieldUri: findLink(operation, "field"),
+      operationBoundary: boundaryOutcome,
+      shapeFileExport: shapeFileOutcome,
+      geojson,
+      note:
+        "operationBoundary with 'geometry present' means each operation can carry its own polygon. " +
+        "shapeFileExport shows what the async export returns — a zip signature or a job/status body.",
+    });
+  })
+);
+
 // ---- GET /api/yield-quality/:orgId -----------------------------------
 // Answers a data-quality question before anything is built on top of yield:
 // of the harvest operations on record, how many actually carry a yield
