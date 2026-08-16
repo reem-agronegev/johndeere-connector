@@ -125,6 +125,59 @@ async function deereGet(url, accessToken) {
   return deereClient.get(url, { headers: deereHeaders(accessToken) });
 }
 
+// ---- Paging -----------------------------------------------------------
+// Deere returns collections one page at a time — 10 items by default — with
+// `total` reporting the full count. Reading the first response alone silently
+// truncates the data: an org with 221 fields looks like it has 10.
+//
+// Pages are followed via the "nextPage" link where present, falling back to
+// the documented pageOffset/itemLimit parameters.
+const DEERE_PAGE_SIZE = 100; // the API's maximum; fewer round trips than 10
+const MAX_PAGES = 200; // guard against a malformed nextPage loop
+
+async function deereGetAll(url, accessToken, { pageSize = DEERE_PAGE_SIZE } = {}) {
+  const values = [];
+  let total = null;
+  let pages = 0;
+
+  const firstUrl = new URL(url);
+  if (!firstUrl.searchParams.has("itemLimit")) {
+    firstUrl.searchParams.set("itemLimit", String(pageSize));
+  }
+  let nextUrl = firstUrl.toString();
+
+  while (nextUrl && pages < MAX_PAGES) {
+    const response = await deereGet(nextUrl, accessToken);
+    const data = response.data;
+
+    if (Array.isArray(data.values)) values.push(...data.values);
+    if (total === null && typeof data.total === "number") total = data.total;
+    pages++;
+
+    const nextLink = findLink(data, "nextPage");
+    if (nextLink) {
+      nextUrl = nextLink;
+    } else if (total !== null && values.length < total && Array.isArray(data.values) && data.values.length > 0) {
+      // No nextPage link, but there is more to fetch — page by offset.
+      const offsetUrl = new URL(url);
+      offsetUrl.searchParams.set("itemLimit", String(pageSize));
+      offsetUrl.searchParams.set("pageOffset", String(values.length));
+      nextUrl = offsetUrl.toString();
+    } else {
+      nextUrl = null;
+    }
+
+    if (nextUrl) await sleep(100);
+  }
+
+  return {
+    values,
+    total: total ?? values.length,
+    pagesFetched: pages,
+    complete: total === null || values.length >= total,
+  };
+}
+
 // ---- Step A: Kick off the flow -------------------------------------------
 app.get("/auth/deere/start", (req, res) => {
   const state = generateRandomState(); // TODO: store & verify this (CSRF protection)
@@ -350,13 +403,15 @@ async function fetchOrgCollection({ orgId, rel, res, resultKey, missingHint }) {
     });
   }
 
-  const response = await deereGet(uri, accessToken);
+  const response = await deereGetAll(uri, accessToken);
 
   return res.json({
     organization: { id: org.id, name: org.name },
     source: uri,
-    total: response.data.total,
-    [resultKey]: response.data.values || response.data,
+    total: response.total,
+    returned: response.values.length,
+    pagesFetched: response.pagesFetched,
+    [resultKey]: response.values,
   });
 }
 
@@ -430,13 +485,13 @@ async function fetchFieldOperationsForField(field, accessToken) {
   }
 
   try {
-    const response = await deereGet(uri, accessToken);
-    const operations = response.data.values || [];
+    const response = await deereGetAll(uri, accessToken);
+    const operations = response.values;
     return {
       fieldId: field.id,
       fieldName: field.name,
       status: "ok",
-      total: response.data.total ?? operations.length,
+      total: response.total,
       operations,
     };
   } catch (err) {
@@ -482,8 +537,8 @@ app.get(
       return res.status(403).json({ message: "Field data not shared with this application." });
     }
 
-    const fieldsResponse = await deereGet(fieldsUri, accessToken);
-    let fields = fieldsResponse.data.values || [];
+    const fieldsResponse = await deereGetAll(fieldsUri, accessToken);
+    let fields = fieldsResponse.values || [];
 
     if (singleFieldId) {
       fields = fields.filter((f) => f.id === singleFieldId);
@@ -506,7 +561,7 @@ app.get(
 
     res.json({
       organization: { id: org.id, name: org.name },
-      fieldsInOrg: fieldsResponse.data.total,
+      fieldsInOrg: fieldsResponse.total,
       fieldsQueried: results.length,
       fieldsWithOperations: withOps.length,
       totalOperations: results.reduce((n, r) => n + r.operations.length, 0),
@@ -838,8 +893,8 @@ async function collectOperationFeatures(orgId, accessToken, { limit, types }) {
   const fieldsUri = findLink(org, "fields");
   if (!fieldsUri) throw Object.assign(new Error("Field data not shared"), { statusCode: 403 });
 
-  const fieldsResponse = await deereGet(fieldsUri, accessToken);
-  let fields = fieldsResponse.data.values || [];
+  const fieldsResponse = await deereGetAll(fieldsUri, accessToken);
+  let fields = fieldsResponse.values || [];
   if (limit > 0) fields = fields.slice(0, limit);
 
   const fieldBoundaryCache = new Map();
@@ -863,7 +918,7 @@ async function collectOperationFeatures(orgId, accessToken, { limit, types }) {
     if (i + FIELD_OPS_BATCH_SIZE < fields.length) await sleep(FIELD_OPS_BATCH_PAUSE_MS);
   }
 
-  return { org, fieldsScanned: fields.length, fieldsInOrg: fieldsResponse.data.total, features, skipped };
+  return { org, fieldsScanned: fields.length, fieldsInOrg: fieldsResponse.total, features, skipped };
 }
 
 // ---- GET /api/operations-geojson/:orgId -------------------------------
@@ -1111,8 +1166,8 @@ app.get(
     const fieldsUri = findLink(org, "fields");
     if (!fieldsUri) return res.status(403).json({ message: "Field data not shared." });
 
-    const fieldsResponse = await deereGet(fieldsUri, accessToken);
-    let fields = fieldsResponse.data.values || [];
+    const fieldsResponse = await deereGetAll(fieldsUri, accessToken);
+    let fields = fieldsResponse.values || [];
     if (limit > 0) fields = fields.slice(0, limit);
 
     // Group by name first, so only the colliding fields need a boundary call.
@@ -1184,7 +1239,7 @@ app.get(
     res.json({
       organization: { id: org.id, name: org.name },
       fieldsScanned: fields.length,
-      fieldsInOrg: fieldsResponse.data.total,
+      fieldsInOrg: fieldsResponse.total,
       uniqueNames: byName.size,
       namesUsedMoreThanOnce: collisions.length,
       fieldsInvolved: colliding.length,
@@ -1357,8 +1412,8 @@ app.get(
     const fieldsUri = findLink(org, "fields");
     if (!fieldsUri) return res.status(403).json({ message: "Field data not shared." });
 
-    const fieldsResponse = await deereGet(fieldsUri, accessToken);
-    let fields = fieldsResponse.data.values || [];
+    const fieldsResponse = await deereGetAll(fieldsUri, accessToken);
+    let fields = fieldsResponse.values || [];
     if (limit > 0) fields = fields.slice(0, limit);
 
     // Collect harvest operations first, then inspect each one's measurements.
@@ -1430,7 +1485,7 @@ app.get(
     res.json({
       organization: { id: org.id, name: org.name },
       fieldsScanned: fields.length,
-      fieldsInOrg: fieldsResponse.data.total,
+      fieldsInOrg: fieldsResponse.total,
       harvestOperations: harvests.length,
       measurementErrors,
       populated: {
@@ -1575,8 +1630,8 @@ app.get(
     const fieldsUri = findLink(org, "fields");
     if (!fieldsUri) return res.status(403).json({ message: "Field data not shared." });
 
-    const fieldsResponse = await deereGet(fieldsUri, accessToken);
-    let fields = fieldsResponse.data.values || [];
+    const fieldsResponse = await deereGetAll(fieldsUri, accessToken);
+    let fields = fieldsResponse.values || [];
     if (limit > 0) fields = fields.slice(0, limit);
 
     const byType = {};
@@ -1625,7 +1680,7 @@ app.get(
 
     res.json({
       organization: { id: org.id, name: org.name },
-      fieldsInOrg: fieldsResponse.data.total,
+      fieldsInOrg: fieldsResponse.total,
       fieldsSampled: fields.length,
       totalOperations,
       errors,
@@ -1848,8 +1903,8 @@ app.get(
     const uri = findLink(org, "boundaries");
     if (!uri) return res.status(403).json({ message: "Boundary data not shared with this application." });
 
-    const response = await deereGet(uri, accessToken);
-    let boundaries = response.data.values || [];
+    const response = await deereGetAll(uri, accessToken);
+    let boundaries = response.values;
     if (activeOnly) boundaries = boundaries.filter((b) => b.active);
 
     const features = boundaries.map(boundaryToGeoJsonFeature).filter(Boolean);
@@ -1861,7 +1916,7 @@ app.get(
       metadata: {
         organization: { id: org.id, name: org.name },
         returned: features.length,
-        totalFromDeere: response.data.total,
+        totalFromDeere: response.total,
         activeOnly,
       },
     });
