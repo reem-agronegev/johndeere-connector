@@ -1088,6 +1088,224 @@ function geometryToWkt(geometry) {
   );
 }
 
+// ---- GET /api/richest/:orgId ------------------------------------------
+// Finds the best field/season combination to use as a worked example: the one
+// with the most operations, ideally spanning several operation types.
+//
+// Deliberately lightweight — it reads each field's operation list and nothing
+// else. Opening boundaries and measurements for every operation across 221
+// fields would be thousands of requests and would time out.
+//
+//   ?limit=N   fields to scan (default 0 = all)
+//   ?season=Y  restrict the ranking to one crop season
+app.get(
+  "/api/richest/:orgId",
+  handleDeereRoute("richest field and season", async (req, res) => {
+    const { orgId } = req.params;
+    const limit = req.query.limit === undefined ? 0 : parseInt(req.query.limit, 10);
+    const seasonFilter = req.query.season || null;
+
+    const found = await findTokenForOrg(orgId);
+    if (!found) {
+      return res.status(404).json({ message: "No stored token grants access to this organization." });
+    }
+    const accessToken = await getValidAccessToken(found.row);
+
+    const orgsResponse = await deereGet(`${API_ROOT}/organizations`, accessToken);
+    const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
+    if (!org) return res.status(404).json({ message: "Organization not visible with this token." });
+
+    const fieldsUri = findLink(org, "fields");
+    if (!fieldsUri) return res.status(403).json({ message: "Field data not shared." });
+
+    const fieldsResponse = await deereGetAll(fieldsUri, accessToken);
+    let fields = fieldsResponse.values;
+    if (limit > 0) fields = fields.slice(0, limit);
+
+    // key: "fieldId|season"
+    const combos = new Map();
+    const seasonTotals = {};
+    let totalOperations = 0;
+    let fieldsWithAny = 0;
+    let errors = 0;
+
+    for (let i = 0; i < fields.length; i += FIELD_OPS_BATCH_SIZE) {
+      const batch = fields.slice(i, i + FIELD_OPS_BATCH_SIZE);
+      const results = await Promise.all(batch.map((f) => fetchFieldOperationsForField(f, accessToken)));
+
+      results.forEach((r, j) => {
+        if (r.status === "error") errors++;
+        if (r.operations.length > 0) fieldsWithAny++;
+
+        for (const op of r.operations) {
+          const season = op.cropSeason || "(none)";
+          if (seasonFilter && season !== seasonFilter) continue;
+
+          totalOperations++;
+          seasonTotals[season] = (seasonTotals[season] || 0) + 1;
+
+          const key = `${batch[j].id}|${season}`;
+          if (!combos.has(key)) {
+            combos.set(key, {
+              fieldId: batch[j].id,
+              fieldName: r.fieldName,
+              season,
+              operations: 0,
+              types: new Set(),
+              crops: new Set(),
+              firstDate: null,
+              lastDate: null,
+            });
+          }
+          const c = combos.get(key);
+          c.operations++;
+          if (op.fieldOperationType) c.types.add(op.fieldOperationType);
+          if (op.cropName) c.crops.add(op.cropName);
+          const d = op.startDate?.slice(0, 10);
+          if (d) {
+            if (!c.firstDate || d < c.firstDate) c.firstDate = d;
+            if (!c.lastDate || d > c.lastDate) c.lastDate = d;
+          }
+        }
+      });
+
+      if (i + FIELD_OPS_BATCH_SIZE < fields.length) await sleep(FIELD_OPS_BATCH_PAUSE_MS);
+    }
+
+    // Rank by operation count, but favour variety: a season showing planting,
+    // spraying and harvest together makes a far better demonstration layer
+    // than the same number of repeat sprayings.
+    const ranked = [...combos.values()]
+      .map((c) => ({
+        fieldId: c.fieldId,
+        fieldName: c.fieldName,
+        season: c.season,
+        operations: c.operations,
+        distinctTypes: c.types.size,
+        types: [...c.types].sort(),
+        crops: [...c.crops].sort(),
+        firstDate: c.firstDate,
+        lastDate: c.lastDate,
+        score: c.operations + c.types.size * 3,
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    const top = ranked[0];
+
+    res.json({
+      organization: { id: org.id, name: org.name },
+      fieldsScanned: fields.length,
+      fieldsInOrg: fieldsResponse.total,
+      fieldsWithOperations: fieldsWithAny,
+      totalOperations,
+      errors,
+      operationsBySeason: Object.fromEntries(Object.entries(seasonTotals).sort()),
+      best: top
+        ? {
+            ...top,
+            geojsonUrl: `/api/field-season-geojson/${orgId}/${top.fieldId}/${top.season}`,
+          }
+        : null,
+      top20: ranked.slice(0, 20),
+    });
+  })
+);
+
+// ---- GET /api/field-season-geojson/:orgId/:fieldId/:season -------------
+// One field, one season, as a GIS-ready layer: the field boundary plus a
+// polygon per operation carried out on it that season.
+//
+// Features are tagged with layerRole so they can be styled separately —
+// "field-boundary" for the outline, "operation" for each pass.
+app.get(
+  "/api/field-season-geojson/:orgId/:fieldId/:season",
+  handleDeereRoute("field season GeoJSON", async (req, res) => {
+    const { orgId, fieldId, season } = req.params;
+
+    const found = await findTokenForOrg(orgId);
+    if (!found) {
+      return res.status(404).json({ message: "No stored token grants access to this organization." });
+    }
+    const accessToken = await getValidAccessToken(found.row);
+
+    const orgsResponse = await deereGet(`${API_ROOT}/organizations`, accessToken);
+    const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
+    if (!org) return res.status(404).json({ message: "Organization not visible with this token." });
+
+    const fieldsUri = findLink(org, "fields");
+    if (!fieldsUri) return res.status(403).json({ message: "Field data not shared." });
+
+    const fieldsResponse = await deereGetAll(fieldsUri, accessToken);
+    const field = fieldsResponse.values.find((f) => f.id === fieldId);
+    if (!field) return res.status(404).json({ message: "Field not found in this organization." });
+
+    const features = [];
+
+    // The field outline, so the operation polygons have context.
+    const bUri = findLink(field, "boundaries");
+    if (bUri) {
+      try {
+        const r = await deereGetAll(bUri, accessToken);
+        const active = r.values.find((b) => b.active) || r.values[0];
+        if (active) {
+          const f = boundaryToGeoJsonFeature(active);
+          if (f) {
+            features.push({
+              ...f,
+              properties: {
+                layerRole: "field-boundary",
+                fieldName: field.name,
+                fieldId: field.id,
+                season,
+                boundaryName: active.name,
+                areaHa: active.area?.valueAsDouble ?? null,
+              },
+            });
+          }
+        }
+      } catch {
+        /* boundary is optional context, not a hard failure */
+      }
+    }
+
+    // One polygon per operation in the requested season.
+    const opsResult = await fetchFieldOperationsForField(field, accessToken);
+    const seasonOps = opsResult.operations.filter((op) => String(op.cropSeason) === String(season));
+
+    const cache = new Map();
+    for (const op of seasonOps) {
+      const built = await buildOperationFeature(field, op, accessToken, cache);
+      if (built.type === "Feature") {
+        features.push({
+          ...built,
+          properties: { layerRole: "operation", ...built.properties },
+        });
+      }
+      await sleep(80);
+    }
+
+    const filename = `${(field.name || "field").replace(/[^a-z0-9]+/gi, "-")}-${season}.geojson`;
+    if (req.query.download === "true") {
+      res.setHeader("Content-Type", "application/geo+json");
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    }
+
+    res.json({
+      type: "FeatureCollection",
+      features,
+      metadata: {
+        organization: { id: org.id, name: org.name },
+        field: { id: field.id, name: field.name },
+        season,
+        operationsInSeason: seasonOps.length,
+        operationsWithPolygon: features.filter((f) => f.properties.layerRole === "operation").length,
+        hasFieldBoundary: features.some((f) => f.properties.layerRole === "field-boundary"),
+        crs: "EPSG:4326",
+      },
+    });
+  })
+);
+
 // ---- Duplicate field-name detection -----------------------------------
 // Asifey Bar has two distinct field IDs both named "101", and three named
 // "---". Grouping by name would merge unrelated parcels into one bogus crop
