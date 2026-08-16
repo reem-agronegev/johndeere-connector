@@ -885,7 +885,7 @@ async function buildOperationFeature(field, operation, accessToken, fieldBoundar
 
 // Walks fields and builds a feature per operation. Shared by both exports so
 // the map and the spreadsheet always describe the same data.
-async function collectOperationFeatures(orgId, accessToken, { limit, types }) {
+async function collectOperationFeatures(orgId, accessToken, { limit, types, fieldId, season }) {
   const orgsResponse = await deereGet(`${API_ROOT}/organizations`, accessToken);
   const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
   if (!org) throw Object.assign(new Error("Organization not visible"), { statusCode: 404 });
@@ -895,7 +895,18 @@ async function collectOperationFeatures(orgId, accessToken, { limit, types }) {
 
   const fieldsResponse = await deereGetAll(fieldsUri, accessToken);
   let fields = fieldsResponse.values || [];
-  if (limit > 0) fields = fields.slice(0, limit);
+
+  // Narrowing to one field turns a 221-field walk into a single field's worth
+  // of requests, which is what makes a per-field export fast enough to run
+  // interactively.
+  if (fieldId) {
+    fields = fields.filter((f) => f.id === fieldId);
+    if (fields.length === 0) {
+      throw Object.assign(new Error("Field not found in this organization"), { statusCode: 404 });
+    }
+  } else if (limit > 0) {
+    fields = fields.slice(0, limit);
+  }
 
   const fieldBoundaryCache = new Map();
   const features = [];
@@ -909,6 +920,7 @@ async function collectOperationFeatures(orgId, accessToken, { limit, types }) {
       const field = batch[j];
       for (const op of results[j].operations) {
         if (types && !types.includes(op.fieldOperationType)) continue;
+        if (season && String(op.cropSeason) !== String(season)) continue;
         const built = await buildOperationFeature(field, op, accessToken, fieldBoundaryCache);
         if (built.type === "Feature") features.push(built);
         else skipped.push(built.properties);
@@ -933,13 +945,15 @@ app.get(
     const { orgId } = req.params;
     const limit = req.query.limit === undefined ? 15 : parseInt(req.query.limit, 10);
     const types = req.query.types ? req.query.types.split(",").map((s) => s.trim()) : null;
+    const fieldId = req.query.fieldId || null;
+    const season = req.query.season || null;
 
     const found = await findTokenForOrg(orgId);
     if (!found) return res.status(404).json({ message: "No stored token for this organization." });
     const accessToken = await getValidAccessToken(found.row);
 
     const { org, fieldsScanned, fieldsInOrg, features, skipped } =
-      await collectOperationFeatures(orgId, accessToken, { limit, types });
+      await collectOperationFeatures(orgId, accessToken, { limit, types, fieldId, season });
 
     res.json({
       type: "FeatureCollection",
@@ -971,13 +985,15 @@ app.get(
     const { orgId } = req.params;
     const limit = req.query.limit === undefined ? 15 : parseInt(req.query.limit, 10);
     const types = req.query.types ? req.query.types.split(",").map((s) => s.trim()) : null;
+    const fieldId = req.query.fieldId || null;
+    const season = req.query.season || null;
 
     const found = await findTokenForOrg(orgId);
     if (!found) return res.status(404).json({ message: "No stored token for this organization." });
     const accessToken = await getValidAccessToken(found.row);
 
     const { org, fieldsScanned, fieldsInOrg, features, skipped } =
-      await collectOperationFeatures(orgId, accessToken, { limit, types });
+      await collectOperationFeatures(orgId, accessToken, { limit, types, fieldId, season });
 
     const ExcelJS = require("exceljs");
     const wb = new ExcelJS.Workbook();
@@ -1067,7 +1083,18 @@ app.get(
     ].forEach(([k, v]) => info.addRow({ k, v }));
     info.getRow(1).font = { bold: true };
 
-    const filename = `agridata-${org.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}-operations.xlsx`;
+    // Reflect the filter in the filename so successive exports don't overwrite
+    // each other in the downloads folder.
+    const slug = (v) => String(v).replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+    const parts = ["agridata", slug(org.name)];
+    if (fieldId) {
+      const fname = features[0]?.properties.fieldName ?? skipped[0]?.fieldName;
+      parts.push(fname ? slug(fname) : "field");
+    }
+    if (season) parts.push(slug(season));
+    if (types) parts.push(slug(types.join("-")));
+    parts.push("operations");
+    const filename = parts.join("-") + ".xlsx";
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
     await wb.xlsx.write(res);
