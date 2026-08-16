@@ -1333,6 +1333,180 @@ app.get(
   })
 );
 
+// ---- GET /api/field-season-zip/:orgId/:fieldId/:season ----------------
+// The same field-season data as separate files in a zip, rather than one
+// merged layer. Loading 19 features as a single GeoJSON stacks them on top of
+// each other in QGIS — the field outline covers everything, and point-sized
+// application records vanish underneath. Separate files load as separate
+// layers that can be toggled independently.
+//
+// The archive contains:
+//   00-field-boundary.geojson      the field outline
+//   NN-<type>-<date>.geojson       one file per operation, ordered by date
+//   by-type/<type>.geojson         all operations of one type together
+//   operations-summary.csv         a flat index of what's in the archive
+app.get(
+  "/api/field-season-zip/:orgId/:fieldId/:season",
+  handleDeereRoute("field season archive", async (req, res) => {
+    const { orgId, fieldId, season } = req.params;
+
+    const found = await findTokenForOrg(orgId);
+    if (!found) {
+      return res.status(404).json({ message: "No stored token grants access to this organization." });
+    }
+    const accessToken = await getValidAccessToken(found.row);
+
+    const orgsResponse = await deereGet(`${API_ROOT}/organizations`, accessToken);
+    const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
+    if (!org) return res.status(404).json({ message: "Organization not visible with this token." });
+
+    const fieldsUri = findLink(org, "fields");
+    if (!fieldsUri) return res.status(403).json({ message: "Field data not shared." });
+
+    const fieldsResponse = await deereGetAll(fieldsUri, accessToken);
+    const field = (fieldsResponse.values || []).find((f) => f.id === fieldId);
+    if (!field) return res.status(404).json({ message: "Field not found in this organization." });
+
+    // Field outline first — it becomes the base layer.
+    let boundaryFeature = null;
+    const bUri = findLink(field, "boundaries");
+    if (bUri) {
+      try {
+        const r = await deereGetAll(bUri, accessToken);
+        const active = (r.values || []).find((b) => b.active) || (r.values || [])[0];
+        if (active) {
+          const f = boundaryToGeoJsonFeature(active);
+          if (f) {
+            boundaryFeature = {
+              ...f,
+              properties: {
+                layerRole: "field-boundary",
+                fieldName: field.name,
+                fieldId: field.id,
+                boundaryName: active.name,
+                areaHa: active.area?.valueAsDouble ?? null,
+              },
+            };
+          }
+        }
+      } catch {
+        /* outline is context, not essential */
+      }
+    }
+
+    const opsResult = await fetchFieldOperationsForField(field, accessToken);
+    const seasonOps = opsResult.operations
+      .filter((op) => String(op.cropSeason) === String(season))
+      .sort((a, b) => String(a.startDate).localeCompare(String(b.startDate)));
+
+    const cache = new Map();
+    const built = [];
+    for (const op of seasonOps) {
+      const feature = await buildOperationFeature(field, op, accessToken, cache);
+      if (feature.type === "Feature") built.push(feature);
+      await sleep(80);
+    }
+
+    const archiver = require("archiver");
+    const safe = (v) => String(v ?? "unknown").replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+    const stem = `${safe(field.name)}-${safe(season)}`;
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${stem}-layers.zip"`);
+
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    archive.on("error", (err) => {
+      console.error("Archive error:", err.message);
+      res.destroy();
+    });
+    archive.pipe(res);
+
+    const asCollection = (features) => JSON.stringify({ type: "FeatureCollection", features }, null, 2);
+
+    if (boundaryFeature) {
+      archive.append(asCollection([boundaryFeature]), { name: "00-field-boundary.geojson" });
+    }
+
+    // One file per operation, numbered by date so they sort chronologically
+    // in the file listing and in QGIS's layer panel.
+    built.forEach((f, i) => {
+      const p = f.properties;
+      const n = String(i + 1).padStart(2, "0");
+      const date = p.startDate ? p.startDate.slice(0, 10) : "no-date";
+      archive.append(asCollection([f]), {
+        name: `${n}-${safe(p.operationType)}-${date}.geojson`,
+      });
+    });
+
+    // Grouped by type as well: often more useful than 18 individual layers.
+    const byType = {};
+    for (const f of built) {
+      const t = f.properties.operationType || "unknown";
+      (byType[t] = byType[t] || []).push(f);
+    }
+    for (const [type, features] of Object.entries(byType)) {
+      archive.append(asCollection(features), { name: `by-type/${safe(type)}.geojson` });
+    }
+
+    // A plain index, so the archive is readable without opening GIS software.
+    const csvEscape = (v) => {
+      if (v === null || v === undefined) return "";
+      const s = String(v);
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const csvColumns = [
+      ["file", (f, i) => `${String(i + 1).padStart(2, "0")}-${safe(f.properties.operationType)}-${(f.properties.startDate || "").slice(0, 10)}.geojson`],
+      ["operationType", (f) => f.properties.operationType],
+      ["startDate", (f) => (f.properties.startDate || "").slice(0, 10)],
+      ["cropName", (f) => f.properties.cropName],
+      ["varieties", (f) => f.properties.varieties],
+      ["computedAreaHa", (f) => f.properties.computedAreaHa],
+      ["reportedAreaHa", (f) => f.properties.reportedAreaHa],
+      ["yieldValue", (f) => f.properties.yieldValue],
+      ["yieldUnit", (f) => f.properties.yieldUnit],
+      ["moisturePct", (f) => f.properties.moisturePct],
+      ["machines", (f) => f.properties.machines],
+      ["products", (f) => f.properties.products],
+      ["geometrySource", (f) => f.properties.geometrySource],
+      ["operationId", (f) => f.properties.operationId],
+    ];
+    // BOM so Excel opens the Hebrew product names correctly.
+    const csv =
+      "\ufeff" +
+      [csvColumns.map(([h]) => h).join(",")]
+        .concat(built.map((f, i) => csvColumns.map(([, get]) => csvEscape(get(f, i))).join(",")))
+        .join("\n");
+    archive.append(csv, { name: "operations-summary.csv" });
+
+    const tinyCount = built.filter((f) => (f.properties.computedAreaHa ?? 0) < 0.1).length;
+    const readme = [
+      `Field: ${field.name} (${field.id})`,
+      `Organization: ${org.name} (${org.id})`,
+      `Season: ${season}`,
+      `Generated: ${new Date().toISOString()}`,
+      `CRS: EPSG:4326`,
+      ``,
+      `Operations in season: ${seasonOps.length}`,
+      `Operations with geometry: ${built.length}`,
+      ``,
+      `Contents`,
+      `  00-field-boundary.geojson   the field outline`,
+      `  NN-<type>-<date>.geojson    one file per operation, in date order`,
+      `  by-type/                    all operations of each type together`,
+      `  operations-summary.csv      flat index of every operation`,
+      ``,
+      `Note on small areas`,
+      `  ${tinyCount} of ${built.length} operations have a computed area below 0.1 ha.`,
+      `  These are records without real GPS coverage - typically entered by hand`,
+      `  rather than logged by a machine display. They will appear as specks on a`,
+      `  map. The area and geometry are what Deere returned, not an export error.`,
+    ].join("\n");
+    archive.append(readme, { name: "README.txt" });
+
+    await archive.finalize();
+  })
+);
+
 // ---- Duplicate field-name detection -----------------------------------
 // Asifey Bar has two distinct field IDs both named "101", and three named
 // "---". Grouping by name would merge unrelated parcels into one bogus crop
