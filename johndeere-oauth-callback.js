@@ -1033,6 +1033,175 @@ function geometryToWkt(geometry) {
   );
 }
 
+// ---- Duplicate field-name detection -----------------------------------
+// Asifey Bar has two distinct field IDs both named "101", and three named
+// "---". Grouping by name would merge unrelated parcels into one bogus crop
+// rotation, so this reports which names repeat and how far apart the parcels
+// actually are on the ground.
+//
+// Distance is computed between boundary centroids: a few metres apart means
+// the same parcel re-registered, kilometres apart means genuinely different
+// fields that happen to share a label.
+
+function haversineMeters(a, b) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLon = toRad(b.lon - a.lon);
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+  const h =
+    Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  return Math.round(2 * R * Math.asin(Math.sqrt(h)));
+}
+
+// Centroid of the active boundary, plus its area — enough to judge whether
+// two same-named fields are the same piece of ground.
+async function fieldFootprint(field, accessToken) {
+  const uri = findLink(field, "boundaries");
+  if (!uri) return null;
+
+  try {
+    const r = await deereGet(uri, accessToken);
+    const boundaries = r.data.values || [];
+    const active = boundaries.find((b) => b.active) || boundaries[0];
+    if (!active) return null;
+
+    let centroid = active.centroid
+      ? { lat: active.centroid.lat, lon: active.centroid.lon }
+      : null;
+
+    // Deere omits the centroid on some boundaries; derive it from the extent.
+    if (!centroid && active.extent) {
+      centroid = {
+        lat: (active.extent.topLeft.lat + active.extent.bottomRight.lat) / 2,
+        lon: (active.extent.topLeft.lon + active.extent.bottomRight.lon) / 2,
+      };
+    }
+
+    return {
+      centroid,
+      areaHa: active.area?.valueAsDouble ?? null,
+      boundaryCount: boundaries.length,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ---- GET /api/duplicate-fields/:orgId ---------------------------------
+//   ?limit=N   fields to scan (default 0 = all; names only repeat across the
+//              full set, so a partial scan misses most collisions)
+app.get(
+  "/api/duplicate-fields/:orgId",
+  handleDeereRoute("duplicate field names", async (req, res) => {
+    const { orgId } = req.params;
+    const limit = req.query.limit === undefined ? 0 : parseInt(req.query.limit, 10);
+
+    const found = await findTokenForOrg(orgId);
+    if (!found) {
+      return res.status(404).json({ message: "No stored token grants access to this organization." });
+    }
+    const accessToken = await getValidAccessToken(found.row);
+
+    const orgsResponse = await deereGet(`${API_ROOT}/organizations`, accessToken);
+    const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
+    if (!org) return res.status(404).json({ message: "Organization not visible with this token." });
+
+    const fieldsUri = findLink(org, "fields");
+    if (!fieldsUri) return res.status(403).json({ message: "Field data not shared." });
+
+    const fieldsResponse = await deereGet(fieldsUri, accessToken);
+    let fields = fieldsResponse.data.values || [];
+    if (limit > 0) fields = fields.slice(0, limit);
+
+    // Group by name first, so only the colliding fields need a boundary call.
+    const byName = new Map();
+    for (const f of fields) {
+      const name = f.name ?? "(no name)";
+      if (!byName.has(name)) byName.set(name, []);
+      byName.get(name).push(f);
+    }
+
+    const collisions = [...byName.entries()].filter(([, list]) => list.length > 1);
+    const colliding = collisions.flatMap(([, list]) => list);
+
+    const footprints = new Map();
+    for (let i = 0; i < colliding.length; i += FIELD_OPS_BATCH_SIZE) {
+      const batch = colliding.slice(i, i + FIELD_OPS_BATCH_SIZE);
+      const results = await Promise.all(batch.map((f) => fieldFootprint(f, accessToken)));
+      batch.forEach((f, j) => footprints.set(f.id, results[j]));
+      if (i + FIELD_OPS_BATCH_SIZE < colliding.length) await sleep(FIELD_OPS_BATCH_PAUSE_MS);
+    }
+
+    const report = collisions.map(([name, list]) => {
+      const members = list.map((f) => {
+        const fp = footprints.get(f.id);
+        return {
+          fieldId: f.id,
+          lastModified: f.lastModifiedTime,
+          archived: f.archived,
+          areaHa: fp?.areaHa ?? null,
+          boundaryCount: fp?.boundaryCount ?? null,
+          centroid: fp?.centroid ?? null,
+        };
+      });
+
+      // Compare every pair so a three-way collision isn't reduced to one number.
+      const pairs = [];
+      for (let i = 0; i < members.length; i++) {
+        for (let j = i + 1; j < members.length; j++) {
+          const a = members[i];
+          const b = members[j];
+          const distance =
+            a.centroid && b.centroid ? haversineMeters(a.centroid, b.centroid) : null;
+          const areaRatio =
+            a.areaHa && b.areaHa ? Math.round((Math.min(a.areaHa, b.areaHa) / Math.max(a.areaHa, b.areaHa)) * 100) / 100 : null;
+
+          let verdict;
+          if (distance === null) verdict = "cannot tell — no geometry on one or both";
+          else if (distance < 100 && (areaRatio === null || areaRatio > 0.8))
+            verdict = "likely the SAME parcel — merge candidate";
+          else if (distance < 500) verdict = "overlapping area — needs a human look";
+          else verdict = "DIFFERENT parcels — must not be merged";
+
+          pairs.push({
+            fieldA: a.fieldId,
+            fieldB: b.fieldId,
+            distanceMeters: distance,
+            areaRatio,
+            verdict,
+          });
+        }
+      }
+
+      return { name, count: members.length, members, comparisons: pairs };
+    });
+
+    const sameParcel = report.filter((r) => r.comparisons.some((c) => c.verdict.startsWith("likely the SAME")));
+    const different = report.filter((r) => r.comparisons.some((c) => c.verdict.startsWith("DIFFERENT")));
+
+    res.json({
+      organization: { id: org.id, name: org.name },
+      fieldsScanned: fields.length,
+      fieldsInOrg: fieldsResponse.data.total,
+      uniqueNames: byName.size,
+      namesUsedMoreThanOnce: collisions.length,
+      fieldsInvolved: colliding.length,
+      summary: {
+        likelySameParcel: sameParcel.map((r) => r.name),
+        definitelyDifferent: different.map((r) => r.name),
+      },
+      guidance:
+        "Group operations by fieldId, never by name. Where a name maps to parcels " +
+        "that are metres apart, they can be linked to one internal polygon_id; where " +
+        "they are kilometres apart, they are separate fields and merging would produce " +
+        "a false crop rotation.",
+      details: report,
+    });
+  })
+);
+
 // ---- GET /api/operation-boundary/:orgId/:operationId -----------------
 // Each field operation carries a "boundary" link — the area actually worked
 // in that pass, which is not the same as the field's own boundary. A combine
