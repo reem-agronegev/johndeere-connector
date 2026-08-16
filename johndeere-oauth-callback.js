@@ -37,7 +37,12 @@ const API_ROOT = "https://api.deere.com/platform";
 // a "Manage" (level 3) permission at connections.deere.com.
 // work1/work2 and files are left out until Deere approves those APIs;
 // requesting an unapproved scope fails the whole authorization.
-const SCOPES = "ag1 ag2 ag3 eq1 org1 files offline_access";
+// Deere support (15 Aug 2026) advised the Assets API needs an equipment
+// write-tier scope, not eq1 — quoting it as "eg2" in the same message where
+// they said their docs were wrong on this point. Both spellings are requested
+// since one of them is almost certainly a typo; an unrecognised scope is
+// ignored by the authorization server rather than failing the request.
+const SCOPES = "ag1 ag2 ag3 eq1 eq2 eg2 org1 files offline_access";
 const DEERE_ACCEPT_HEADER = "application/vnd.deere.axiom.v3+json";
 
 // ---- Database setup --------------------------------------------------
@@ -402,24 +407,124 @@ app.get(
   )
 );
 
+// ---- Field operations: per-field, not per-org -------------------------
+// Deere support confirmed (15 Aug 2026) that
+// /platform/organizations/{orgId}/fieldOperations is an internal lookup
+// endpoint, not publicly available, and is slated for removal — it appears in
+// the org's `links` but always returns 403. The supported route is per field:
+// /platform/organizations/{orgId}/fields/{fieldId}/fieldOperations
+//
+// That means one request per field. With 221 fields on a real grower account
+// this needs to be paced, so requests run in small batches with a pause
+// between them rather than all at once.
+
+const FIELD_OPS_BATCH_SIZE = 5;
+const FIELD_OPS_BATCH_PAUSE_MS = 250;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function fetchFieldOperationsForField(field, accessToken) {
+  const uri = findLink(field, "fieldOperation");
+  if (!uri) {
+    return { fieldId: field.id, fieldName: field.name, status: "no link", operations: [] };
+  }
+
+  try {
+    const response = await deereGet(uri, accessToken);
+    const operations = response.data.values || [];
+    return {
+      fieldId: field.id,
+      fieldName: field.name,
+      status: "ok",
+      total: response.data.total ?? operations.length,
+      operations,
+    };
+  } catch (err) {
+    return {
+      fieldId: field.id,
+      fieldName: field.name,
+      status: "error",
+      httpStatus: err.response?.status || null,
+      detail: err.response?.data || err.message,
+      operations: [],
+    };
+  }
+}
+
 // ---- GET /api/field-operations/:orgId --------------------------------
-// Planting, spraying, tillage, harvest. This is the one that feeds fact_ops
-// and fact_yield. Expected to be blocked while the grower's Work permission
-// is at level 0 and work1/work2 scopes are unapproved — the error body will
-// say so explicitly rather than failing silently.
+// Walks the org's fields and collects operations for each. This is what feeds
+// fact_ops and fact_yield.
+//
+// Query parameters:
+//   ?limit=N        stop after N fields (default 25; use 0 for all)
+//   ?fieldId=UUID   fetch a single field only
+//   ?summary=true   omit the operation bodies, return counts only
 app.get(
   "/api/field-operations/:orgId",
-  handleDeereRoute("field operations", (req, res) =>
-    fetchOrgCollection({
-      orgId: req.params.orgId,
-      rel: "fieldOperation",
-      res,
-      resultKey: "fieldOperations",
-      missingHint:
-        "Field operations sit under the Work permission. The grower must raise it " +
-        "above 0 at connections.deere.com, and the app needs work1/work2 scopes approved by Deere.",
-    })
-  )
+  handleDeereRoute("field operations", async (req, res) => {
+    const { orgId } = req.params;
+    const limit = req.query.limit === undefined ? 25 : parseInt(req.query.limit, 10);
+    const summaryOnly = req.query.summary === "true";
+    const singleFieldId = req.query.fieldId;
+
+    const found = await findTokenForOrg(orgId);
+    if (!found) {
+      return res.status(404).json({ message: "No stored token grants access to this organization." });
+    }
+    const accessToken = await getValidAccessToken(found.row);
+
+    const orgsResponse = await deereGet(`${API_ROOT}/organizations`, accessToken);
+    const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
+    if (!org) return res.status(404).json({ message: "Organization not visible with this token." });
+
+    const fieldsUri = findLink(org, "fields");
+    if (!fieldsUri) {
+      return res.status(403).json({ message: "Field data not shared with this application." });
+    }
+
+    const fieldsResponse = await deereGet(fieldsUri, accessToken);
+    let fields = fieldsResponse.data.values || [];
+
+    if (singleFieldId) {
+      fields = fields.filter((f) => f.id === singleFieldId);
+      if (fields.length === 0) {
+        return res.status(404).json({ message: "Field not found in this organization." });
+      }
+    } else if (limit > 0) {
+      fields = fields.slice(0, limit);
+    }
+
+    const results = [];
+    for (let i = 0; i < fields.length; i += FIELD_OPS_BATCH_SIZE) {
+      const batch = fields.slice(i, i + FIELD_OPS_BATCH_SIZE);
+      results.push(...(await Promise.all(batch.map((f) => fetchFieldOperationsForField(f, accessToken)))));
+      if (i + FIELD_OPS_BATCH_SIZE < fields.length) await sleep(FIELD_OPS_BATCH_PAUSE_MS);
+    }
+
+    const withOps = results.filter((r) => r.operations.length > 0);
+    const errored = results.filter((r) => r.status === "error");
+
+    res.json({
+      organization: { id: org.id, name: org.name },
+      fieldsInOrg: fieldsResponse.data.total,
+      fieldsQueried: results.length,
+      fieldsWithOperations: withOps.length,
+      totalOperations: results.reduce((n, r) => n + r.operations.length, 0),
+      errors: errored.length,
+      // A single repeated error across every field usually means a permission
+      // or entitlement problem rather than anything field-specific.
+      sampleError: errored[0] ? { httpStatus: errored[0].httpStatus, detail: errored[0].detail } : null,
+      fields: summaryOnly
+        ? results.map(({ fieldId, fieldName, status, total, httpStatus }) => ({
+            fieldId,
+            fieldName,
+            status,
+            total: total ?? 0,
+            httpStatus,
+          }))
+        : results,
+    });
+  })
 );
 
 // ---- GET /api/machines/:orgId ----------------------------------------
@@ -518,7 +623,10 @@ app.get(
     const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
     if (!org) return res.status(404).json({ message: "Organization not visible with this token." });
 
-    const rels = ["fields", "farms", "boundaries", "fieldOperation", "machines", "assets", "files", "clients", "flags"];
+    // "fieldOperation" is deliberately absent: Deere confirmed the org-level
+    // endpoint is internal-only and always 403s. Use /api/field-operations/:orgId,
+    // which walks fields individually, to check operations access.
+    const rels = ["fields", "farms", "boundaries", "machines", "assets", "files", "clients", "flags"];
     const report = {};
 
     for (const rel of rels) {
