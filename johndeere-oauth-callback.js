@@ -661,6 +661,378 @@ function summariseMeasurement(data) {
   return summary;
 }
 
+// ---- Operation layer: polygon + attributes per operation --------------
+// Builds the layer the platform actually needs: one polygon per field
+// operation, carrying what happened there. The polygon comes from the
+// operation's own boundary (the area the machine actually covered),
+// falling back to the field boundary when the operation has none.
+//
+// Deere generates operation boundaries on demand and returns them without an
+// area figure, so area is computed here from the geometry.
+
+// Spherical excess over a WGS84 sphere. Accurate enough for field-scale
+// polygons and avoids pulling in a projection library.
+function ringAreaSqMeters(ring) {
+  const R = 6378137;
+  let total = 0;
+  for (let i = 0; i < ring.length - 1; i++) {
+    const [lon1, lat1] = ring[i];
+    const [lon2, lat2] = ring[i + 1];
+    total +=
+      ((lon2 - lon1) * Math.PI) / 180 *
+      (2 + Math.sin((lat1 * Math.PI) / 180) + Math.sin((lat2 * Math.PI) / 180));
+  }
+  return Math.abs((total * R * R) / 2);
+}
+
+function geometryAreaHa(geometry) {
+  if (!geometry) return null;
+  // First ring of each polygon is the exterior; the rest are holes.
+  const polygons =
+    geometry.type === "Polygon" ? [geometry.coordinates] : geometry.coordinates;
+  let sqm = 0;
+  for (const rings of polygons) {
+    rings.forEach((ring, idx) => {
+      const a = ringAreaSqMeters(ring);
+      sqm += idx === 0 ? a : -a;
+    });
+  }
+  return Math.round((sqm / 10000) * 100) / 100;
+}
+
+// Pulls the numbers out of an operation's measurement summary. Every harvest
+// layer returns the same record, so one call to measurementTypes is enough
+// rather than one per layer.
+async function fetchOperationMeasurements(operation, accessToken) {
+  const uri = findLink(operation, "measurementTypes");
+  if (!uri) return null;
+
+  try {
+    const r = await deereGet(uri, accessToken);
+    const values = r.data.values || [];
+    const record = values.find((v) => v.yield || v.wetMass || v.area) || values[0];
+    if (!record) return null;
+
+    return {
+      reportedAreaHa: record.area?.value ?? null,
+      yieldValue: record.yield?.value ?? null,
+      yieldUnit: record.yield?.unitId ?? null,
+      averageYield: record.averageYield?.value ?? null,
+      averageYieldUnit: record.averageYield?.unitId ?? null,
+      wetMassT: record.wetMass?.value ?? null,
+      averageWetMassTHa: record.averageWetMass?.value ?? null,
+      moisturePct: record.averageMoisture?.value ?? null,
+      averageSpeedKmh: record.averageSpeed?.value ?? null,
+      varietyTotals: (record.varietyTotals || []).map((v) => ({
+        name: v.name,
+        areaHa: v.area?.value ?? null,
+        yield: v.yield?.value ?? null,
+      })),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Assembles one operation into a GeoJSON feature with flat properties —
+// flat because the same records feed the spreadsheet export.
+async function buildOperationFeature(field, operation, accessToken, fieldBoundaryCache) {
+  let geometry = null;
+  let geometrySource = "none";
+
+  // Preferred: the operation's own coverage boundary.
+  try {
+    const r = await deereGet(
+      `${API_ROOT}/fieldOperations/${operation.id}/boundary`,
+      accessToken
+    );
+    const candidate = r.data.multipolygons ? r.data : (r.data.values || [])[0];
+    const feature = candidate ? boundaryToGeoJsonFeature(candidate) : null;
+    if (feature) {
+      geometry = feature.geometry;
+      geometrySource = "operation";
+    }
+  } catch {
+    /* fall through to the field boundary */
+  }
+
+  // Fallback: the field's active boundary, cached so each field is fetched once.
+  if (!geometry) {
+    const fieldId = field.id;
+    if (!fieldBoundaryCache.has(fieldId)) {
+      let cached = null;
+      try {
+        const bUri = findLink(field, "boundaries");
+        if (bUri) {
+          const r = await deereGet(bUri, accessToken);
+          const active = (r.data.values || []).find((b) => b.active) || (r.data.values || [])[0];
+          const feature = active ? boundaryToGeoJsonFeature(active) : null;
+          if (feature) cached = feature.geometry;
+        }
+      } catch {
+        /* leave null */
+      }
+      fieldBoundaryCache.set(fieldId, cached);
+    }
+    geometry = fieldBoundaryCache.get(fieldId);
+    if (geometry) geometrySource = "field";
+  }
+
+  const measurements = await fetchOperationMeasurements(operation, accessToken);
+
+  const products = (operation.products || []).flatMap((p) => {
+    const parts = [];
+    if (p.rate) parts.push(`${p.name} ${p.rate.value} ${p.rate.unitId}`);
+    else parts.push(p.name);
+    for (const c of p.components || []) {
+      parts.push(`${c.name} ${c.rate?.value ?? ""} ${c.rate?.unitId ?? ""}`.trim());
+    }
+    return parts;
+  });
+
+  const varieties = [
+    ...new Set([
+      ...(operation.varieties || []).map((v) => v.name),
+      ...((measurements?.varietyTotals || []).map((v) => v.name)),
+    ]),
+  ].filter(Boolean);
+
+  const properties = {
+    operationId: operation.id,
+    operationType: operation.fieldOperationType,
+    cropSeason: operation.cropSeason,
+    cropName: operation.cropName || null,
+    varieties: varieties.join(", ") || null,
+    startDate: operation.startDate || null,
+    endDate: operation.endDate || null,
+    fieldId: field.id,
+    fieldName: field.name,
+    machines: (operation.fieldOperationMachines || [])
+      .map((m) => m.name || m.vin)
+      .filter(Boolean)
+      .join(", ") || null,
+    products: products.join(" | ") || null,
+    geometrySource,
+    computedAreaHa: geometryAreaHa(geometry),
+    reportedAreaHa: measurements?.reportedAreaHa ?? null,
+    yieldValue: measurements?.yieldValue ?? null,
+    yieldUnit: measurements?.yieldUnit ?? null,
+    averageYield: measurements?.averageYield ?? null,
+    averageYieldUnit: measurements?.averageYieldUnit ?? null,
+    wetMassT: measurements?.wetMassT ?? null,
+    averageWetMassTHa: measurements?.averageWetMassTHa ?? null,
+    moisturePct: measurements?.moisturePct ?? null,
+    averageSpeedKmh: measurements?.averageSpeedKmh ?? null,
+  };
+
+  return geometry ? { type: "Feature", geometry, properties } : { type: null, properties };
+}
+
+// Walks fields and builds a feature per operation. Shared by both exports so
+// the map and the spreadsheet always describe the same data.
+async function collectOperationFeatures(orgId, accessToken, { limit, types }) {
+  const orgsResponse = await deereGet(`${API_ROOT}/organizations`, accessToken);
+  const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
+  if (!org) throw Object.assign(new Error("Organization not visible"), { statusCode: 404 });
+
+  const fieldsUri = findLink(org, "fields");
+  if (!fieldsUri) throw Object.assign(new Error("Field data not shared"), { statusCode: 403 });
+
+  const fieldsResponse = await deereGet(fieldsUri, accessToken);
+  let fields = fieldsResponse.data.values || [];
+  if (limit > 0) fields = fields.slice(0, limit);
+
+  const fieldBoundaryCache = new Map();
+  const features = [];
+  const skipped = [];
+
+  for (let i = 0; i < fields.length; i += FIELD_OPS_BATCH_SIZE) {
+    const batch = fields.slice(i, i + FIELD_OPS_BATCH_SIZE);
+    const results = await Promise.all(batch.map((f) => fetchFieldOperationsForField(f, accessToken)));
+
+    for (let j = 0; j < results.length; j++) {
+      const field = batch[j];
+      for (const op of results[j].operations) {
+        if (types && !types.includes(op.fieldOperationType)) continue;
+        const built = await buildOperationFeature(field, op, accessToken, fieldBoundaryCache);
+        if (built.type === "Feature") features.push(built);
+        else skipped.push(built.properties);
+        await sleep(80);
+      }
+    }
+    if (i + FIELD_OPS_BATCH_SIZE < fields.length) await sleep(FIELD_OPS_BATCH_PAUSE_MS);
+  }
+
+  return { org, fieldsScanned: fields.length, fieldsInOrg: fieldsResponse.data.total, features, skipped };
+}
+
+// ---- GET /api/operations-geojson/:orgId -------------------------------
+// One polygon per operation, attributes attached. Load into QGIS, geojson.io,
+// or the map endpoint below.
+//
+//   ?limit=N          fields to scan (default 15; 0 = all, slow)
+//   ?types=harvest    comma-separated operation types to include
+app.get(
+  "/api/operations-geojson/:orgId",
+  handleDeereRoute("operations GeoJSON", async (req, res) => {
+    const { orgId } = req.params;
+    const limit = req.query.limit === undefined ? 15 : parseInt(req.query.limit, 10);
+    const types = req.query.types ? req.query.types.split(",").map((s) => s.trim()) : null;
+
+    const found = await findTokenForOrg(orgId);
+    if (!found) return res.status(404).json({ message: "No stored token for this organization." });
+    const accessToken = await getValidAccessToken(found.row);
+
+    const { org, fieldsScanned, fieldsInOrg, features, skipped } =
+      await collectOperationFeatures(orgId, accessToken, { limit, types });
+
+    res.json({
+      type: "FeatureCollection",
+      features,
+      metadata: {
+        organization: { id: org.id, name: org.name },
+        fieldsScanned,
+        fieldsInOrg,
+        operationsWithGeometry: features.length,
+        operationsWithoutGeometry: skipped.length,
+        geometrySources: features.reduce((acc, f) => {
+          acc[f.properties.geometrySource] = (acc[f.properties.geometrySource] || 0) + 1;
+          return acc;
+        }, {}),
+      },
+    });
+  })
+);
+
+// ---- GET /api/operations-xlsx/:orgId ----------------------------------
+// The same records as a spreadsheet: one sheet of operations, one of harvest
+// only, and the polygon geometry as WKT so it can be re-imported into GIS.
+//
+//   ?limit=N        fields to scan (default 15; 0 = all, slow)
+//   ?types=harvest  comma-separated operation types
+app.get(
+  "/api/operations-xlsx/:orgId",
+  handleDeereRoute("operations spreadsheet", async (req, res) => {
+    const { orgId } = req.params;
+    const limit = req.query.limit === undefined ? 15 : parseInt(req.query.limit, 10);
+    const types = req.query.types ? req.query.types.split(",").map((s) => s.trim()) : null;
+
+    const found = await findTokenForOrg(orgId);
+    if (!found) return res.status(404).json({ message: "No stored token for this organization." });
+    const accessToken = await getValidAccessToken(found.row);
+
+    const { org, fieldsScanned, fieldsInOrg, features, skipped } =
+      await collectOperationFeatures(orgId, accessToken, { limit, types });
+
+    const ExcelJS = require("exceljs");
+    const wb = new ExcelJS.Workbook();
+    wb.creator = "AgriData connector";
+    wb.created = new Date();
+
+    const columns = [
+      { header: "Field", key: "fieldName", width: 14 },
+      { header: "Operation", key: "operationType", width: 13 },
+      { header: "Season", key: "cropSeason", width: 9 },
+      { header: "Crop", key: "cropName", width: 18 },
+      { header: "Varieties", key: "varieties", width: 20 },
+      { header: "Start", key: "startDate", width: 12 },
+      { header: "End", key: "endDate", width: 12 },
+      { header: "Area (ha, computed)", key: "computedAreaHa", width: 18 },
+      { header: "Area (ha, reported)", key: "reportedAreaHa", width: 18 },
+      { header: "Yield", key: "yieldValue", width: 10 },
+      { header: "Yield unit", key: "yieldUnit", width: 10 },
+      { header: "Avg yield", key: "averageYield", width: 11 },
+      { header: "Avg yield unit", key: "averageYieldUnit", width: 13 },
+      { header: "Wet mass (t)", key: "wetMassT", width: 12 },
+      { header: "Avg wet mass (t/ha)", key: "averageWetMassTHa", width: 18 },
+      { header: "Moisture (%)", key: "moisturePct", width: 12 },
+      { header: "Avg speed (km/h)", key: "averageSpeedKmh", width: 15 },
+      { header: "Machines", key: "machines", width: 24 },
+      { header: "Products", key: "products", width: 40 },
+      { header: "Geometry source", key: "geometrySource", width: 15 },
+      { header: "Operation ID", key: "operationId", width: 40 },
+    ];
+
+    const toRow = (p) => ({
+      ...p,
+      startDate: p.startDate ? p.startDate.slice(0, 10) : null,
+      endDate: p.endDate ? p.endDate.slice(0, 10) : null,
+    });
+
+    const opsSheet = wb.addWorksheet("Operations");
+    opsSheet.columns = columns;
+    for (const f of features) opsSheet.addRow(toRow(f.properties));
+    for (const p of skipped) opsSheet.addRow(toRow(p));
+    opsSheet.getRow(1).font = { bold: true };
+    opsSheet.autoFilter = { from: "A1", to: { row: 1, column: columns.length } };
+    opsSheet.views = [{ state: "frozen", ySplit: 1 }];
+
+    const harvests = features.filter((f) => f.properties.operationType === "harvest");
+    if (harvests.length > 0) {
+      const hs = wb.addWorksheet("Harvest");
+      hs.columns = columns;
+      for (const f of harvests) hs.addRow(toRow(f.properties));
+      hs.getRow(1).font = { bold: true };
+      hs.autoFilter = { from: "A1", to: { row: 1, column: columns.length } };
+      hs.views = [{ state: "frozen", ySplit: 1 }];
+    }
+
+    // WKT keeps the polygons usable outside this file — QGIS, PostGIS and
+    // BigQuery all read it directly.
+    const geo = wb.addWorksheet("Geometry (WKT)");
+    geo.columns = [
+      { header: "Operation ID", key: "id", width: 40 },
+      { header: "Field", key: "field", width: 14 },
+      { header: "Operation", key: "type", width: 13 },
+      { header: "Season", key: "season", width: 9 },
+      { header: "WKT", key: "wkt", width: 120 },
+    ];
+    for (const f of features) {
+      geo.addRow({
+        id: f.properties.operationId,
+        field: f.properties.fieldName,
+        type: f.properties.operationType,
+        season: f.properties.cropSeason,
+        wkt: geometryToWkt(f.geometry),
+      });
+    }
+    geo.getRow(1).font = { bold: true };
+
+    const info = wb.addWorksheet("About");
+    info.columns = [{ header: "Field", key: "k", width: 30 }, { header: "Value", key: "v", width: 60 }];
+    [
+      ["Organization", `${org.name} (${org.id})`],
+      ["Generated", new Date().toISOString()],
+      ["Fields scanned", `${fieldsScanned} of ${fieldsInOrg}`],
+      ["Operations with geometry", features.length],
+      ["Operations without geometry", skipped.length],
+      ["Source", "John Deere Operations Center API (read-only)"],
+      ["Note", "Computed area is derived from polygon geometry; reported area comes from the machine."],
+      ["Note", "Yield units follow Deere's coding: m3 = volume, t = tonnes, t1ha-1 = tonnes per hectare."],
+    ].forEach(([k, v]) => info.addRow({ k, v }));
+    info.getRow(1).font = { bold: true };
+
+    const filename = `agridata-${org.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}-operations.xlsx`;
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    await wb.xlsx.write(res);
+    res.end();
+  })
+);
+
+function geometryToWkt(geometry) {
+  if (!geometry) return null;
+  const ringToWkt = (ring) => "(" + ring.map(([lon, lat]) => `${lon} ${lat}`).join(", ") + ")";
+  if (geometry.type === "Polygon") {
+    return "POLYGON(" + geometry.coordinates.map(ringToWkt).join(", ") + ")";
+  }
+  return (
+    "MULTIPOLYGON(" +
+    geometry.coordinates.map((poly) => "(" + poly.map(ringToWkt).join(", ") + ")").join(", ") +
+    ")"
+  );
+}
+
 // ---- GET /api/operation-boundary/:orgId/:operationId -----------------
 // Each field operation carries a "boundary" link — the area actually worked
 // in that pass, which is not the same as the field's own boundary. A combine
