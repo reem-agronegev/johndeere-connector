@@ -42,7 +42,7 @@ const API_ROOT = "https://api.deere.com/platform";
 // they said their docs were wrong on this point. Both spellings are requested
 // since one of them is almost certainly a typo; an unrecognised scope is
 // ignored by the authorization server rather than failing the request.
-const SCOPES = "ag1 ag2 ag3 eq1 eq2 eg2 org1 files offline_access";
+const SCOPES = "ag1 ag2 ag3 eq1 eq2 org1 files offline_access";
 const DEERE_ACCEPT_HEADER = "application/vnd.deere.axiom.v3+json";
 
 // ---- Database setup --------------------------------------------------
