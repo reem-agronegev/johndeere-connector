@@ -527,6 +527,140 @@ app.get(
   })
 );
 
+// ---- GET /api/operation/:orgId/:operationId --------------------------
+// Opens a single field operation and follows its measurement links — the
+// harvest yield, seeding varieties, application rate and speed layers that
+// sit underneath the operation record.
+//
+// READ ONLY: every call here is a GET through deereGet(). Nothing is written
+// back to the grower's account.
+//
+// Measurement payloads can be large (sub-field grids), so the response is
+// summarised by default and the raw values are only included on request.
+//
+// Query parameters:
+//   ?raw=true       include the full measurement payloads
+//   ?only=rel1,rel2 fetch just these measurement links
+app.get(
+  "/api/operation/:orgId/:operationId",
+  handleDeereRoute("field operation detail", async (req, res) => {
+    const { orgId, operationId } = req.params;
+    const includeRaw = req.query.raw === "true";
+    const only = req.query.only ? req.query.only.split(",").map((s) => s.trim()) : null;
+
+    const found = await findTokenForOrg(orgId);
+    if (!found) {
+      return res.status(404).json({ message: "No stored token grants access to this organization." });
+    }
+    const accessToken = await getValidAccessToken(found.row);
+
+    // Fetch the operation itself first, so we work from its own link list
+    // rather than assuming which measurement types exist for its type.
+    const opResponse = await deereGet(`${API_ROOT}/fieldOperations/${operationId}`, accessToken);
+    const operation = opResponse.data;
+
+    // Measurement links are the ones ending in "Result", plus the
+    // measurementTypes index itself.
+    let measurementRels = (operation.links || [])
+      .map((l) => l.rel)
+      .filter((rel) => rel.endsWith("Result") || rel === "measurementTypes");
+
+    if (only) measurementRels = measurementRels.filter((rel) => only.includes(rel));
+
+    const measurements = {};
+    for (const rel of measurementRels) {
+      const uri = findLink(operation, rel);
+      try {
+        const r = await deereGet(uri, accessToken);
+        measurements[rel] = includeRaw ? r.data : summariseMeasurement(r.data);
+      } catch (err) {
+        measurements[rel] = {
+          status: "error",
+          httpStatus: err.response?.status || null,
+          detail: err.response?.data || err.message,
+        };
+      }
+      await sleep(120); // be gentle: one operation can have 8+ layers
+    }
+
+    res.json({
+      operation: {
+        id: operationId,
+        type: operation.fieldOperationType,
+        cropSeason: operation.cropSeason,
+        startDate: operation.startDate,
+        endDate: operation.endDate,
+        machines: (operation.fieldOperationMachines || []).map((m) => ({ name: m.name, vin: m.vin })),
+        products: (operation.products || []).map((p) => ({
+          name: p.name,
+          type: p.productType,
+          tankMix: p.tankMix,
+          rate: p.rate ? { value: p.rate.value, unit: p.rate.unitId } : null,
+          components: (p.components || []).map((c) => ({
+            name: c.name,
+            type: c.productType,
+            rate: c.rate ? { value: c.rate.value, unit: c.rate.unitId } : null,
+          })),
+        })),
+      },
+      measurementsAvailable: measurementRels,
+      measurements,
+      note: includeRaw
+        ? "Raw payloads included."
+        : "Summarised. Add ?raw=true for full payloads, or ?only=harvestYieldResult to target one layer.",
+    });
+  })
+);
+
+// Measurement payloads vary by type, so rather than assuming a shape this
+// reports what came back: the keys present, how many values, and the range
+// and units of any numbers found. Enough to design a mapping against without
+// pulling megabytes of grid data into the browser.
+function summariseMeasurement(data) {
+  if (data == null) return { empty: true };
+
+  const summary = { topLevelKeys: Object.keys(data) };
+
+  if (Array.isArray(data.values)) {
+    summary.valueCount = data.values.length;
+    summary.total = data.total;
+    if (data.values.length > 0) {
+      summary.firstValue = data.values[0];
+      summary.valueKeys = typeof data.values[0] === "object" ? Object.keys(data.values[0]) : null;
+    }
+  }
+
+  // Walk the payload for anything that looks like a measurement so units and
+  // ranges surface even when they're nested a few levels down.
+  const numbers = [];
+  const units = new Set();
+  (function walk(node, depth) {
+    if (depth > 6 || node == null) return;
+    if (Array.isArray(node)) {
+      // Sample rather than scan: grids can hold tens of thousands of points.
+      for (const item of node.slice(0, 200)) walk(item, depth + 1);
+      return;
+    }
+    if (typeof node !== "object") return;
+    if (typeof node.value === "number") numbers.push(node.value);
+    if (node.unitId) units.add(node.unitId);
+    if (node.unit) units.add(node.unit);
+    for (const v of Object.values(node)) walk(v, depth + 1);
+  })(data, 0);
+
+  if (numbers.length > 0) {
+    summary.numericSample = {
+      count: numbers.length,
+      min: Math.min(...numbers),
+      max: Math.max(...numbers),
+      note: "Sampled from the first 200 array entries at each level.",
+    };
+  }
+  if (units.size > 0) summary.units = [...units];
+
+  return summary;
+}
+
 // ---- GET /api/operation-types/:orgId ---------------------------------
 // Answers a question the per-field view can't: which kinds of operation does
 // this grower actually have on record? Sampling one field is misleading —
