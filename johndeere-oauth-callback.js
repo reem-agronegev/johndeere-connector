@@ -661,6 +661,100 @@ function summariseMeasurement(data) {
   return summary;
 }
 
+// ---- GET /api/measurement/:orgId/:operationId/:measurementName -------
+// Opens one measurement layer and probes its "mapImage" link, which is where
+// the sub-field detail lives — the heat maps Operations Center renders.
+//
+// The mapImage URI is identical to the layer's own "self" URI, so what comes
+// back depends on the Accept header: the axiom media type yields the summary
+// record, while image types may yield a rendered raster. This endpoint tries
+// several and reports what each returns, rather than assuming a format.
+//
+// READ ONLY: all requests are GETs.
+app.get(
+  "/api/measurement/:orgId/:operationId/:measurementName",
+  handleDeereRoute("measurement layer", async (req, res) => {
+    const { orgId, operationId, measurementName } = req.params;
+
+    const found = await findTokenForOrg(orgId);
+    if (!found) {
+      return res.status(404).json({ message: "No stored token grants access to this organization." });
+    }
+    const accessToken = await getValidAccessToken(found.row);
+
+    const baseUri = `${API_ROOT}/fieldOperations/${operationId}/measurementTypes/${measurementName}`;
+
+    // Accept headers worth trying, and what each would mean if it works.
+    const attempts = [
+      { accept: DEERE_ACCEPT_HEADER, meaning: "Deere axiom JSON (summary record)" },
+      { accept: "application/json", meaning: "plain JSON" },
+      { accept: "image/png", meaning: "rendered raster image" },
+      { accept: "application/vnd.deere.axiom.v3+png", meaning: "axiom PNG variant" },
+      { accept: "application/geo+json", meaning: "GeoJSON grid" },
+      { accept: "*/*", meaning: "server's default choice" },
+    ];
+
+    const results = {};
+    for (const { accept, meaning } of attempts) {
+      try {
+        const r = await deereClient.get(baseUri, {
+          headers: { Authorization: `Bearer ${accessToken}`, Accept: accept },
+          // Binary-safe: an image would be corrupted if parsed as text.
+          responseType: "arraybuffer",
+          validateStatus: () => true,
+        });
+
+        const contentType = r.headers["content-type"] || "(none)";
+        const bytes = r.data ? r.data.length : 0;
+        const entry = { meaning, httpStatus: r.status, contentType, bytes };
+
+        if (r.status >= 400) {
+          entry.outcome = "error";
+        } else if (contentType.includes("image")) {
+          // A real raster: report its signature rather than dumping bytes.
+          const head = Buffer.from(r.data.slice(0, 8)).toString("hex");
+          entry.outcome = "IMAGE";
+          entry.signature = head;
+          entry.isPng = head.startsWith("89504e47");
+          entry.isJpeg = head.startsWith("ffd8ff");
+        } else {
+          const text = Buffer.from(r.data).toString("utf8");
+          try {
+            const parsed = JSON.parse(text);
+            entry.outcome = "json";
+            entry.topLevelKeys = Object.keys(parsed);
+            // A points/values array here would be the sub-field grid.
+            const gridKey = ["values", "points", "features", "cells"].find((k) => Array.isArray(parsed[k]));
+            if (gridKey) {
+              entry.gridKey = gridKey;
+              entry.gridCount = parsed[gridKey].length;
+              entry.gridFirst = parsed[gridKey][0];
+            }
+          } catch {
+            entry.outcome = "non-JSON text";
+            entry.preview = text.slice(0, 200);
+          }
+        }
+
+        results[accept] = entry;
+      } catch (err) {
+        results[accept] = { meaning, outcome: "request failed", detail: err.message };
+      }
+      await sleep(150);
+    }
+
+    res.json({
+      operationId,
+      measurementName,
+      uri: baseUri,
+      attempts: results,
+      note:
+        "An entry with outcome IMAGE means Deere renders this layer server-side. " +
+        "An entry with a gridKey means the raw sub-field values are retrievable as data.",
+    });
+  })
+);
+
 // ---- GET /api/operation-types/:orgId ---------------------------------
 // Answers a question the per-field view can't: which kinds of operation does
 // this grower actually have on record? Sampling one field is misleading —
