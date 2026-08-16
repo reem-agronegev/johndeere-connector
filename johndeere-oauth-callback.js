@@ -661,6 +661,129 @@ function summariseMeasurement(data) {
   return summary;
 }
 
+// ---- GET /api/yield-quality/:orgId -----------------------------------
+// Answers a data-quality question before anything is built on top of yield:
+// of the harvest operations on record, how many actually carry a yield
+// figure? A combine can log area, speed and duration while its yield sensor
+// records nothing — the sample we inspected showed 9.02 ha harvested with
+// yield 0. If that is typical, a yield table would be mostly zeros.
+//
+// Reads the summary record for each harvest operation (one call per
+// operation, via measurementTypes) and reports how many are populated.
+//
+// Query parameters:
+//   ?limit=N   fields to scan (default 60; 0 = all, slow)
+app.get(
+  "/api/yield-quality/:orgId",
+  handleDeereRoute("yield data quality", async (req, res) => {
+    const { orgId } = req.params;
+    const limit = req.query.limit === undefined ? 60 : parseInt(req.query.limit, 10);
+
+    const found = await findTokenForOrg(orgId);
+    if (!found) {
+      return res.status(404).json({ message: "No stored token grants access to this organization." });
+    }
+    const accessToken = await getValidAccessToken(found.row);
+
+    const orgsResponse = await deereGet(`${API_ROOT}/organizations`, accessToken);
+    const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
+    if (!org) return res.status(404).json({ message: "Organization not visible with this token." });
+
+    const fieldsUri = findLink(org, "fields");
+    if (!fieldsUri) return res.status(403).json({ message: "Field data not shared." });
+
+    const fieldsResponse = await deereGet(fieldsUri, accessToken);
+    let fields = fieldsResponse.data.values || [];
+    if (limit > 0) fields = fields.slice(0, limit);
+
+    // Collect harvest operations first, then inspect each one's measurements.
+    const harvests = [];
+    for (let i = 0; i < fields.length; i += FIELD_OPS_BATCH_SIZE) {
+      const batch = fields.slice(i, i + FIELD_OPS_BATCH_SIZE);
+      const results = await Promise.all(batch.map((f) => fetchFieldOperationsForField(f, accessToken)));
+      for (const r of results) {
+        for (const op of r.operations) {
+          if (op.fieldOperationType === "harvest") {
+            harvests.push({ fieldName: r.fieldName, fieldId: r.fieldId, op });
+          }
+        }
+      }
+      if (i + FIELD_OPS_BATCH_SIZE < fields.length) await sleep(FIELD_OPS_BATCH_PAUSE_MS);
+    }
+
+    const rows = [];
+    let withYield = 0;
+    let withWetMass = 0;
+    let withMoisture = 0;
+    let measurementErrors = 0;
+
+    for (const h of harvests) {
+      const uri = findLink(h.op, "measurementTypes");
+      if (!uri) {
+        measurementErrors++;
+        continue;
+      }
+
+      try {
+        const r = await deereGet(uri, accessToken);
+        // Any of the harvest layers carries the same summary record, so the
+        // first one that has yield fields is enough.
+        const record = (r.data.values || []).find((v) => v.yield || v.wetMass) || (r.data.values || [])[0];
+
+        const yieldVal = record?.yield?.value ?? null;
+        const wetMassVal = record?.wetMass?.value ?? null;
+        const moistureVal = record?.averageMoisture?.value ?? null;
+        const avgYield = record?.averageYield?.value ?? null;
+
+        if (yieldVal > 0) withYield++;
+        if (wetMassVal > 0) withWetMass++;
+        if (moistureVal > 0) withMoisture++;
+
+        rows.push({
+          field: h.fieldName,
+          season: h.op.cropSeason,
+          date: h.op.startDate?.slice(0, 10),
+          areaHa: record?.area?.value ?? null,
+          yield: yieldVal,
+          yieldUnit: record?.yield?.unitId ?? null,
+          averageYield: avgYield,
+          wetMassT: wetMassVal,
+          moisturePct: moistureVal,
+          varieties: (record?.varietyTotals || []).map((v) => v.name),
+          hasUsableYield: yieldVal > 0 || wetMassVal > 0,
+        });
+      } catch (err) {
+        measurementErrors++;
+      }
+      await sleep(120);
+    }
+
+    const usable = rows.filter((r) => r.hasUsableYield);
+    const seasonsWithYield = [...new Set(usable.map((r) => r.season))].sort();
+    const varietiesSeen = [...new Set(rows.flatMap((r) => r.varieties))].sort();
+
+    res.json({
+      organization: { id: org.id, name: org.name },
+      fieldsScanned: fields.length,
+      fieldsInOrg: fieldsResponse.data.total,
+      harvestOperations: harvests.length,
+      measurementErrors,
+      populated: {
+        withYieldVolume: withYield,
+        withWetMass: withWetMass,
+        withMoisture: withMoisture,
+        usableForYieldAnalysis: usable.length,
+      },
+      // The headline number: what share of harvests could feed a yield table.
+      usableSharePct:
+        harvests.length > 0 ? Math.round((usable.length / harvests.length) * 1000) / 10 : null,
+      seasonsWithUsableYield: seasonsWithYield,
+      varietiesSeen,
+      harvests: rows,
+    });
+  })
+);
+
 // ---- GET /api/measurement/:orgId/:operationId/:measurementName -------
 // Opens one measurement layer and probes its "mapImage" link, which is where
 // the sub-field detail lives — the heat maps Operations Center renders.
