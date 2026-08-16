@@ -42,7 +42,7 @@ const API_ROOT = "https://api.deere.com/platform";
 // they said their docs were wrong on this point. Both spellings are requested
 // since one of them is almost certainly a typo; an unrecognised scope is
 // ignored by the authorization server rather than failing the request.
-const SCOPES = "ag1 ag2 ag3 eq1 eq2 org1 files offline_access";
+const SCOPES = "ag1 ag2 ag3 eq1 eq2 eg2 org1 files offline_access";
 const DEERE_ACCEPT_HEADER = "application/vnd.deere.axiom.v3+json";
 
 // ---- Database setup --------------------------------------------------
@@ -523,6 +523,102 @@ app.get(
             httpStatus,
           }))
         : results,
+    });
+  })
+);
+
+// ---- GET /api/operation-types/:orgId ---------------------------------
+// Answers a question the per-field view can't: which kinds of operation does
+// this grower actually have on record? Sampling one field is misleading —
+// a field worked only by a sprayer will show nothing but "application" even
+// when the org has harvest data elsewhere.
+//
+// Walks fields, collects every operation, and reports counts by type and by
+// crop season. Note cropSeason is used rather than the calendar year of
+// startDate: Deere assigns autumn work to the following season, and that is
+// the agronomically correct grouping for rotation analysis.
+//
+// Query parameters:
+//   ?limit=N   how many fields to sample (default 40; 0 = all 221, slow)
+app.get(
+  "/api/operation-types/:orgId",
+  handleDeereRoute("operation type census", async (req, res) => {
+    const { orgId } = req.params;
+    const limit = req.query.limit === undefined ? 40 : parseInt(req.query.limit, 10);
+
+    const found = await findTokenForOrg(orgId);
+    if (!found) {
+      return res.status(404).json({ message: "No stored token grants access to this organization." });
+    }
+    const accessToken = await getValidAccessToken(found.row);
+
+    const orgsResponse = await deereGet(`${API_ROOT}/organizations`, accessToken);
+    const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
+    if (!org) return res.status(404).json({ message: "Organization not visible with this token." });
+
+    const fieldsUri = findLink(org, "fields");
+    if (!fieldsUri) return res.status(403).json({ message: "Field data not shared." });
+
+    const fieldsResponse = await deereGet(fieldsUri, accessToken);
+    let fields = fieldsResponse.data.values || [];
+    if (limit > 0) fields = fields.slice(0, limit);
+
+    const byType = {};
+    const bySeason = {};
+    const typeSeasons = {};
+    const examples = {};
+    let totalOperations = 0;
+    let errors = 0;
+
+    for (let i = 0; i < fields.length; i += FIELD_OPS_BATCH_SIZE) {
+      const batch = fields.slice(i, i + FIELD_OPS_BATCH_SIZE);
+      const results = await Promise.all(batch.map((f) => fetchFieldOperationsForField(f, accessToken)));
+
+      for (const r of results) {
+        if (r.status === "error") errors++;
+        for (const op of r.operations) {
+          const type = op.fieldOperationType || "(unspecified)";
+          const season = op.cropSeason || "(none)";
+
+          byType[type] = (byType[type] || 0) + 1;
+          bySeason[season] = (bySeason[season] || 0) + 1;
+          (typeSeasons[type] = typeSeasons[type] || new Set()).add(season);
+          totalOperations++;
+
+          // Keep one example per type so the shape of each can be inspected
+          // without pulling the whole payload back.
+          if (!examples[type]) {
+            examples[type] = {
+              fieldName: r.fieldName,
+              cropSeason: op.cropSeason,
+              startDate: op.startDate,
+              endDate: op.endDate,
+              machines: (op.fieldOperationMachines || []).map((m) => m.name),
+              products: (op.products || []).map((p) => p.name),
+              measurementLinks: (op.links || [])
+                .map((l) => l.rel)
+                .filter((rel) => rel.toLowerCase().includes("result") || rel === "measurementTypes"),
+              operationUri: findLink(op, "self"),
+            };
+          }
+        }
+      }
+
+      if (i + FIELD_OPS_BATCH_SIZE < fields.length) await sleep(FIELD_OPS_BATCH_PAUSE_MS);
+    }
+
+    res.json({
+      organization: { id: org.id, name: org.name },
+      fieldsInOrg: fieldsResponse.data.total,
+      fieldsSampled: fields.length,
+      totalOperations,
+      errors,
+      operationTypes: byType,
+      seasonsPerType: Object.fromEntries(
+        Object.entries(typeSeasons).map(([t, s]) => [t, [...s].sort()])
+      ),
+      operationsBySeason: Object.fromEntries(Object.entries(bySeason).sort()),
+      examplePerType: examples,
     });
   })
 );
