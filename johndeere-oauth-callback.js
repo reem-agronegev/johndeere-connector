@@ -1594,6 +1594,12 @@ app.get(
     attempts.push({ stage: "initial request", accept: DEERE_ACCEPT_HEADER, ...(await probe(shapeUri, DEERE_ACCEPT_HEADER)) });
 
     // Poll until something other than 202 comes back.
+    //
+    // Polls must repeat Deere's own media type. A wildcard Accept is rejected
+    // with 406 ("Accepted types are: application/vnd.deere.axiom.v3+json")
+    // even for a status check, so */* never reaches the job at all. The
+    // response is still read as a buffer, so a binary archive would survive
+    // if the completed export is delivered on this URI.
     for (let i = 1; i <= polls; i++) {
       const last = attempts[attempts.length - 1];
       if (last.outcome === "ZIP ARCHIVE" || (last.httpStatus === 200 && last.bytes > 0)) break;
@@ -1602,9 +1608,9 @@ app.get(
       const target = last.location || shapeUri;
       attempts.push({
         stage: `poll ${i} after ${((i * waitMs) / 1000).toFixed(0)}s`,
-        accept: "*/*",
+        accept: DEERE_ACCEPT_HEADER,
         uri: target,
-        ...(await probe(target, "*/*")),
+        ...(await probe(target, DEERE_ACCEPT_HEADER)),
       });
     }
 
@@ -1623,7 +1629,9 @@ app.get(
         final.outcome === "ZIP ARCHIVE"
           ? "Export completed — the archive contains the sub-field data. Contents listed above."
           : final.httpStatus === 202
-          ? "Still returning 202 after polling. Either the job takes longer than this window, or the result is collected somewhere other than the same URI — worth asking Deere support how the completed export is retrieved."
+          ? "Still returning 202 after polling. Either the job takes longer than this window, or the completed export is collected from a different URI — worth asking Deere support how a finished fieldOps export is retrieved."
+          : final.httpStatus === 406
+          ? "Rejected on media type. Polls must send application/vnd.deere.axiom.v3+json; a wildcard Accept is refused even for a status check."
           : "Export did not return an archive. See the final attempt for what came back instead.",
     });
   })
