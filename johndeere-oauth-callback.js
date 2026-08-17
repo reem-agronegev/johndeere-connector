@@ -1546,9 +1546,19 @@ app.get(
 
     // Describe a response without assuming its type: a zip, a JSON job record
     // and an error page all need telling apart.
+    //
+    // The completed export is served from a pre-signed S3 URL, which carries
+    // its own signature in the query string. Sending Deere's bearer token
+    // there as well makes S3 reject the request with "Only one auth mechanism
+    // allowed", so the Authorization header is dropped for those hosts.
     async function probe(uri, accept) {
+      const isPresigned = /amazonaws\.com/i.test(uri) && /X-Amz-Signature=/i.test(uri);
+      const headers = isPresigned
+        ? {}
+        : { Authorization: `Bearer ${accessToken}`, Accept: accept };
+
       const r = await deereClient.get(uri, {
-        headers: { Authorization: `Bearer ${accessToken}`, Accept: accept },
+        headers,
         responseType: "arraybuffer",
         validateStatus: () => true,
         maxRedirects: 0,
@@ -1593,24 +1603,37 @@ app.get(
     // Kick the job off.
     attempts.push({ stage: "initial request", accept: DEERE_ACCEPT_HEADER, ...(await probe(shapeUri, DEERE_ACCEPT_HEADER)) });
 
-    // Poll until something other than 202 comes back.
+    // Poll until the export is ready.
+    //
+    // Deere answers 202 while the job runs, then 307 with a Location pointing
+    // at a pre-signed S3 object once it finishes. Following that Location is
+    // what actually retrieves the archive — re-requesting the job URI just
+    // starts the cycle again.
     //
     // Polls must repeat Deere's own media type. A wildcard Accept is rejected
-    // with 406 ("Accepted types are: application/vnd.deere.axiom.v3+json")
-    // even for a status check, so */* never reaches the job at all. The
-    // response is still read as a buffer, so a binary archive would survive
-    // if the completed export is delivered on this URI.
+    // with 406 even for a status check.
     for (let i = 1; i <= polls; i++) {
       const last = attempts[attempts.length - 1];
-      if (last.outcome === "ZIP ARCHIVE" || (last.httpStatus === 200 && last.bytes > 0)) break;
+      if (last.outcome === "ZIP ARCHIVE") break;
+
+      // A redirect means the file is ready: go straight there, no waiting.
+      if (last.httpStatus === 307 && last.location) {
+        attempts.push({
+          stage: `following redirect to completed export`,
+          uri: last.location,
+          ...(await probe(last.location, DEERE_ACCEPT_HEADER)),
+        });
+        continue;
+      }
+
+      if (last.httpStatus === 200 && last.bytes > 0) break;
 
       await sleep(waitMs);
-      const target = last.location || shapeUri;
       attempts.push({
         stage: `poll ${i} after ${((i * waitMs) / 1000).toFixed(0)}s`,
         accept: DEERE_ACCEPT_HEADER,
-        uri: target,
-        ...(await probe(target, DEERE_ACCEPT_HEADER)),
+        uri: shapeUri,
+        ...(await probe(shapeUri, DEERE_ACCEPT_HEADER)),
       });
     }
 
@@ -1627,11 +1650,13 @@ app.get(
       attempts,
       conclusion:
         final.outcome === "ZIP ARCHIVE"
-          ? "Export completed — the archive contains the sub-field data. Contents listed above."
+          ? "Export retrieved. The archive contents are listed above — this is the sub-field data."
           : final.httpStatus === 202
-          ? "Still returning 202 after polling. Either the job takes longer than this window, or the completed export is collected from a different URI — worth asking Deere support how a finished fieldOps export is retrieved."
+          ? "Still processing after the polling window. Try more polls or a longer wait: the job produced a redirect after roughly a minute in earlier runs."
+          : final.httpStatus === 307
+          ? "The export is ready and Deere returned a redirect, but the archive was not retrieved. Check the following-redirect attempt above."
           : final.httpStatus === 406
-          ? "Rejected on media type. Polls must send application/vnd.deere.axiom.v3+json; a wildcard Accept is refused even for a status check."
+          ? "Rejected on media type. Polls must send application/vnd.deere.axiom.v3+json."
           : "Export did not return an archive. See the final attempt for what came back instead.",
     });
   })
