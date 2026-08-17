@@ -1507,6 +1507,147 @@ app.get(
   })
 );
 
+// ---- GET /api/shapefile-export/:orgId/:operationId --------------------
+// Probes the async shapefile export, which is the only route to sub-field
+// detail — the per-point yield and rate readings behind the summary numbers.
+//
+// A first call returned 202 Accepted with an empty body and no Location
+// header, so the job-tracking mechanism is undocumented from our side. This
+// endpoint requests the export, then polls the same URI to see whether the
+// response changes shape once processing completes.
+//
+// READ ONLY. The export is a GET; nothing is written to the grower's account.
+//
+//   ?polls=N     how many times to re-check (default 6)
+//   ?waitMs=N    pause between checks (default 5000)
+app.get(
+  "/api/shapefile-export/:orgId/:operationId",
+  handleDeereRoute("shapefile export", async (req, res) => {
+    const { orgId, operationId } = req.params;
+    const polls = Math.min(parseInt(req.query.polls, 10) || 6, 20);
+    const waitMs = Math.min(parseInt(req.query.waitMs, 10) || 5000, 15000);
+
+    const found = await findTokenForOrg(orgId);
+    if (!found) {
+      return res.status(404).json({ message: "No stored token grants access to this organization." });
+    }
+    const accessToken = await getValidAccessToken(found.row);
+
+    const opResponse = await deereGet(`${API_ROOT}/fieldOperations/${operationId}`, accessToken);
+    const operation = opResponse.data;
+
+    const shapeUri = findLink(operation, "shapeFileAsync");
+    if (!shapeUri) {
+      return res.status(404).json({
+        message: "This operation has no shapeFileAsync link.",
+        availableLinks: (operation.links || []).map((l) => l.rel),
+      });
+    }
+
+    // Describe a response without assuming its type: a zip, a JSON job record
+    // and an error page all need telling apart.
+    async function probe(uri, accept) {
+      const r = await deereClient.get(uri, {
+        headers: { Authorization: `Bearer ${accessToken}`, Accept: accept },
+        responseType: "arraybuffer",
+        validateStatus: () => true,
+        maxRedirects: 0,
+      });
+
+      const contentType = r.headers["content-type"] || "(none)";
+      const bytes = r.data ? r.data.length : 0;
+      const entry = {
+        httpStatus: r.status,
+        contentType,
+        bytes,
+        location: r.headers["location"] || null,
+        retryAfter: r.headers["retry-after"] || null,
+      };
+
+      if (bytes > 0) {
+        const head = Buffer.from(r.data.slice(0, 4)).toString("hex");
+        entry.signature = head;
+        if (head.startsWith("504b0304")) {
+          // PK\x03\x04 — a zip. This is what a real shapefile bundle looks like.
+          entry.outcome = "ZIP ARCHIVE";
+          entry.contents = listZipEntries(Buffer.from(r.data));
+        } else {
+          const text = Buffer.from(r.data).toString("utf8");
+          try {
+            entry.outcome = "json";
+            entry.body = JSON.parse(text);
+          } catch {
+            entry.outcome = "text";
+            entry.preview = text.slice(0, 300);
+          }
+        }
+      } else {
+        entry.outcome = r.status === 202 ? "accepted, still processing" : "empty body";
+      }
+
+      return entry;
+    }
+
+    const attempts = [];
+
+    // Kick the job off.
+    attempts.push({ stage: "initial request", accept: DEERE_ACCEPT_HEADER, ...(await probe(shapeUri, DEERE_ACCEPT_HEADER)) });
+
+    // Poll until something other than 202 comes back.
+    for (let i = 1; i <= polls; i++) {
+      const last = attempts[attempts.length - 1];
+      if (last.outcome === "ZIP ARCHIVE" || (last.httpStatus === 200 && last.bytes > 0)) break;
+
+      await sleep(waitMs);
+      const target = last.location || shapeUri;
+      attempts.push({
+        stage: `poll ${i} after ${((i * waitMs) / 1000).toFixed(0)}s`,
+        accept: "*/*",
+        uri: target,
+        ...(await probe(target, "*/*")),
+      });
+    }
+
+    const final = attempts[attempts.length - 1];
+
+    res.json({
+      operation: {
+        id: operationId,
+        type: operation.fieldOperationType,
+        cropSeason: operation.cropSeason,
+        startDate: operation.startDate,
+      },
+      shapeFileUri: shapeUri,
+      attempts,
+      conclusion:
+        final.outcome === "ZIP ARCHIVE"
+          ? "Export completed — the archive contains the sub-field data. Contents listed above."
+          : final.httpStatus === 202
+          ? "Still returning 202 after polling. Either the job takes longer than this window, or the result is collected somewhere other than the same URI — worth asking Deere support how the completed export is retrieved."
+          : "Export did not return an archive. See the final attempt for what came back instead.",
+    });
+  })
+);
+
+// Reads zip central-directory entries directly, avoiding a dependency just to
+// see what a downloaded archive contains.
+function listZipEntries(buf) {
+  const entries = [];
+  const SIG = 0x02014b50; // central directory file header
+  for (let i = buf.length - 22; i >= 0 && entries.length < 200; i--) {
+    if (buf.readUInt32LE(i) === SIG) {
+      const nameLen = buf.readUInt16LE(i + 28);
+      const extraLen = buf.readUInt16LE(i + 30);
+      const commentLen = buf.readUInt16LE(i + 32);
+      const size = buf.readUInt32LE(i + 24);
+      const name = buf.slice(i + 46, i + 46 + nameLen).toString("utf8");
+      entries.push({ name, uncompressedBytes: size });
+      i -= nameLen + extraLen + commentLen;
+    }
+  }
+  return entries.reverse();
+}
+
 // ---- Duplicate field-name detection -----------------------------------
 // Asifey Bar has two distinct field IDs both named "101", and three named
 // "---". Grouping by name would merge unrelated parcels into one bogus crop
