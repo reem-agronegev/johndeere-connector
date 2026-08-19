@@ -2613,6 +2613,86 @@ app.get("/map/:orgId", (req, res) => {
 // Guarded by DEBUG_TOKEN_KEY: the endpoint 404s unless that env var is set
 // AND matches ?key=... on the request. Remove this route once the support
 // ticket is closed.
+// ---- GET /backup/tokens ----------------------------------------------
+// Exports every stored token as JSON, so a connected grower does not have to
+// re-authorise if the database is lost. Render's free Postgres tier expires,
+// and losing the table would mean losing every connection.
+//
+// The file contains live refresh tokens — treat it like a password file.
+// Save it somewhere private, never in a repository or a chat.
+//
+// Guarded by BACKUP_KEY: 404s unless that env var is set and matches ?key=.
+app.get("/backup/tokens", async (req, res) => {
+  const expectedKey = process.env.BACKUP_KEY;
+  if (!expectedKey || req.query.key !== expectedKey) {
+    return res.status(404).send("Cannot GET " + req.path);
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT organization_id, organization_name, access_token, refresh_token,
+              expires_at, created_at, updated_at
+       FROM deere_tokens ORDER BY created_at`
+    );
+
+    res.setHeader("Content-Type", "application/json");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="deere-tokens-backup-${new Date().toISOString().slice(0, 10)}.json"`
+    );
+    res.json({
+      exportedAt: new Date().toISOString(),
+      tokenCount: rows.length,
+      organizations: rows.map((r) => ({ id: r.organization_id, name: r.organization_name })),
+      warning:
+        "Contains live refresh tokens. Store privately. Anyone holding this file can read the connected growers' data.",
+      tokens: rows,
+    });
+  } catch (err) {
+    console.error("Token backup failed:", err.message);
+    res.status(500).json({ error: "Backup failed." });
+  }
+});
+
+// ---- POST /backup/restore --------------------------------------------
+// Reads a backup file back into a fresh database. Rows are matched on
+// organization_id so restoring twice does not create duplicates.
+//
+// Send the backup file's JSON as the request body.
+app.post("/backup/restore", express.json({ limit: "10mb" }), async (req, res) => {
+  const expectedKey = process.env.BACKUP_KEY;
+  if (!expectedKey || req.query.key !== expectedKey) {
+    return res.status(404).send("Cannot POST " + req.path);
+  }
+
+  const tokens = req.body?.tokens;
+  if (!Array.isArray(tokens)) {
+    return res.status(400).json({ error: "Expected a backup file with a 'tokens' array." });
+  }
+
+  try {
+    let restored = 0;
+    for (const t of tokens) {
+      if (!t.access_token) continue;
+      if (t.organization_id) {
+        await pool.query(`DELETE FROM deere_tokens WHERE organization_id = $1`, [t.organization_id]);
+      }
+      await pool.query(
+        `INSERT INTO deere_tokens
+           (organization_id, organization_name, access_token, refresh_token, expires_at)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [t.organization_id, t.organization_name, t.access_token, t.refresh_token, t.expires_at]
+      );
+      restored++;
+    }
+
+    res.json({ restored, message: "Tokens restored. Verify with /api/organizations." });
+  } catch (err) {
+    console.error("Token restore failed:", err.message);
+    res.status(500).json({ error: "Restore failed.", detail: err.message });
+  }
+});
+
 app.get("/debug/token/:orgId", async (req, res) => {
   const expectedKey = process.env.DEBUG_TOKEN_KEY;
 
