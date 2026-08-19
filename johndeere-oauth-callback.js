@@ -933,6 +933,352 @@ async function collectOperationFeatures(orgId, accessToken, { limit, types, fiel
   return { org, fieldsScanned: fields.length, fieldsInOrg: fieldsResponse.total, features, skipped };
 }
 
+// ---- BigQuery export -------------------------------------------------
+// Produces newline-delimited JSON matching the core.* schema, ready to
+// load into BigQuery. Written as a file export rather than a direct
+// write so the output can be inspected before anything reaches the
+// warehouse — a mismatched type or a dropped geometry is far easier to
+// spot in a file than after a load.
+//
+// Keys are deterministic hashes of (source_system, external_id) rather
+// than random UUIDs. Re-running the export produces the same keys, so a
+// reload updates rows instead of duplicating them.
+
+const crypto = require("crypto");
+
+function surrogateKey(...parts) {
+  return crypto.createHash("sha256").update(parts.join("|")).digest("hex").slice(0, 32);
+}
+
+// BigQuery GEOGRAPHY accepts WKT. Coordinates are rounded to 6 decimal
+// places (~10 cm) — the source mixes 8 and 10 decimal places between
+// boundaries, and without rounding an unchanged polygon would produce a
+// different hash on every sync and look like a redraw.
+function geometryToWktRounded(geometry, dp = 6) {
+  if (!geometry) return null;
+  const r = (n) => Number(n.toFixed(dp));
+  const ring = (coords) => "(" + coords.map(([lon, lat]) => `${r(lon)} ${r(lat)}`).join(", ") + ")";
+  if (geometry.type === "Polygon") {
+    return "POLYGON(" + geometry.coordinates.map(ring).join(", ") + ")";
+  }
+  return (
+    "MULTIPOLYGON(" +
+    geometry.coordinates.map((poly) => "(" + poly.map(ring).join(", ") + ")").join(", ") +
+    ")"
+  );
+}
+
+function geometryHash(geometry) {
+  const wkt = geometryToWktRounded(geometry);
+  return wkt ? crypto.createHash("sha256").update(wkt).digest("hex") : null;
+}
+
+// ---- GET /api/bigquery-export/:orgId ---------------------------------
+// Returns a zip of newline-delimited JSON files, one per target table.
+//
+//   ?limit=N        fields to include (default 25; 0 = all, slow)
+//   ?season=YYYY    restrict to one crop season
+app.get(
+  "/api/bigquery-export/:orgId",
+  handleDeereRoute("BigQuery export", async (req, res) => {
+    const { orgId } = req.params;
+    const limit = req.query.limit === undefined ? 25 : parseInt(req.query.limit, 10);
+    const season = req.query.season || null;
+
+    const found = await findTokenForOrg(orgId);
+    if (!found) {
+      return res.status(404).json({ message: "No stored token grants access to this organization." });
+    }
+    const accessToken = await getValidAccessToken(found.row);
+
+    const now = new Date().toISOString();
+    const SOURCE = "john_deere";
+
+    const orgsResponse = await deereGet(`${API_ROOT}/organizations`, accessToken);
+    const org = (orgsResponse.data.values || []).find((o) => String(o.id) === String(orgId));
+    if (!org) return res.status(404).json({ message: "Organization not visible with this token." });
+
+    const organizationKey = surrogateKey(SOURCE, "org", org.id);
+
+    const rows = {
+      dim_organization: [
+        {
+          organization_key: organizationKey,
+          source_system: SOURCE,
+          external_id: String(org.id),
+          name: org.name,
+          organization_type: org.type ?? null,
+          is_member: org.member ?? null,
+          connected_at: found.row.created_at ?? null,
+          last_synced_at: now,
+          is_active: true,
+          created_at: now,
+          updated_at: now,
+        },
+      ],
+      dim_field: [],
+      dim_polygon: [],
+      fact_operation: [],
+      fact_yield: [],
+      field_id_map: [],
+    };
+
+    // Fields
+    const fieldsUri = findLink(org, "fields");
+    if (!fieldsUri) return res.status(403).json({ message: "Field data not shared." });
+
+    const fieldsResponse = await deereGetAll(fieldsUri, accessToken);
+    let fields = fieldsResponse.values;
+
+    // Field names collide — two distinct fields named "101" sit 7.5 km
+    // apart in the pilot org. Flag them so downstream reporting never
+    // silently groups them together.
+    const nameCounts = {};
+    for (const f of fields) nameCounts[f.name ?? ""] = (nameCounts[f.name ?? ""] || 0) + 1;
+
+    const allFields = fields;
+    if (limit > 0) fields = fields.slice(0, limit);
+
+    const fieldKeyById = new Map();
+    for (const f of allFields) {
+      fieldKeyById.set(f.id, surrogateKey(SOURCE, "field", f.id));
+    }
+
+    for (const f of fields) {
+      const fieldKey = fieldKeyById.get(f.id);
+
+      rows.dim_field.push({
+        field_key: fieldKey,
+        organization_key: organizationKey,
+        source_system: SOURCE,
+        external_id: String(f.id),
+        name: f.name ?? null,
+        name_is_ambiguous: (nameCounts[f.name ?? ""] || 0) > 1,
+        farm_name: null,
+        client_name: null,
+        archived: f.archived ?? null,
+        first_seen_at: now,
+        last_seen_at: now,
+        created_at: now,
+        updated_at: now,
+      });
+
+      rows.field_id_map.push({
+        field_key: fieldKey,
+        source_system: SOURCE,
+        external_id: String(f.id),
+        organization_key: organizationKey,
+        link_method: "direct",
+        confidence: "high",
+        linked_at: now,
+        notes: null,
+      });
+
+      // Boundaries. Deere keeps superseded versions with active=false,
+      // which gives history without having to reconstruct it — but it
+      // does not date them, so valid_from is the discovery date.
+      const bUri = findLink(f, "boundaries");
+      if (bUri) {
+        try {
+          const bResp = await deereGetAll(bUri, accessToken);
+          for (const b of bResp.values) {
+            const feature = boundaryToGeoJsonFeature(b);
+            const geom = feature ? feature.geometry : null;
+            rows.dim_polygon.push({
+              polygon_key: surrogateKey(SOURCE, "boundary", b.id),
+              field_key: fieldKey,
+              organization_key: organizationKey,
+              source_system: SOURCE,
+              external_id: String(b.id),
+              geom: geometryToWktRounded(geom),
+              geometry_hash: geometryHash(geom),
+              centroid: b.centroid ? `POINT(${b.centroid.lon} ${b.centroid.lat})` : null,
+              area_ha_reported: b.area?.valueAsDouble ?? null,
+              area_ha_computed: geom ? geometryAreaHa(geom) : null,
+              workable_area_ha: b.workableArea?.valueAsDouble ?? null,
+              boundary_name: b.name ?? null,
+              source_type: b.sourceType ?? null,
+              is_irrigated: b.irrigated ?? null,
+              is_active_at_source: b.active ?? null,
+              valid_from: now.slice(0, 10),
+              valid_to: null,
+              is_current: b.active ?? false,
+              detected_at: now,
+              created_at: now,
+              updated_at: now,
+            });
+          }
+        } catch {
+          /* a field without boundaries is normal */
+        }
+        await sleep(80);
+      }
+
+      // Operations
+      const opsResult = await fetchFieldOperationsForField(f, accessToken);
+      const cache = new Map();
+
+      for (const op of opsResult.operations) {
+        if (season && String(op.cropSeason) !== String(season)) continue;
+
+        const built = await buildOperationFeature(f, op, accessToken, cache);
+        const p = built.properties;
+        const operationKey = surrogateKey(SOURCE, "op", op.id);
+
+        rows.fact_operation.push({
+          operation_key: operationKey,
+          organization_key: organizationKey,
+          field_key: fieldKey,
+          polygon_key: null,
+          source_system: SOURCE,
+          external_id: String(op.id),
+          operation_type: op.fieldOperationType ?? null,
+          crop_season: op.cropSeason ? parseInt(op.cropSeason, 10) : null,
+          crop_name: op.cropName ?? null,
+          start_date: op.startDate ?? null,
+          end_date: op.endDate ?? null,
+          geom: built.type === "Feature" ? geometryToWktRounded(built.geometry) : null,
+          geometry_source: p.geometrySource,
+          area_ha_computed: p.computedAreaHa,
+          area_ha_reported: p.reportedAreaHa,
+          has_real_coverage: (p.computedAreaHa ?? 0) >= 0.1,
+          machines: (op.fieldOperationMachines || []).map((m) => ({
+            name: m.name ?? null,
+            vin: m.vin ?? null,
+          })),
+          operators: (op.fieldOperationOperators || []).map((o) => o.name).filter(Boolean),
+          products: (op.products || []).map((prod) => ({
+            name: prod.name ?? null,
+            product_type: prod.productType ?? null,
+            is_tank_mix: prod.tankMix ?? null,
+            rate_value: prod.rate?.value ?? null,
+            rate_unit: prod.rate?.unitId ?? null,
+            components: (prod.components || []).map((c) => ({
+              name: c.name ?? null,
+              product_type: c.productType ?? null,
+              rate_value: c.rate?.value ?? null,
+              rate_unit: c.rate?.unitId ?? null,
+            })),
+          })),
+          varieties: (op.varieties || []).map((v) => ({
+            name: v.name ?? null,
+            external_id: v.id ? String(v.id) : null,
+            area_ha: null,
+          })),
+          average_speed_value: null,
+          average_speed_unit: null,
+          ingested_at: now,
+          created_at: now,
+          updated_at: now,
+        });
+
+        // Harvest measurements. Units are kept exactly as Deere returns
+        // them; no conversion happens here.
+        if (op.fieldOperationType === "harvest") {
+          const m = await fetchOperationMeasurements(op, accessToken);
+          if (m) {
+            const usable = (m.yieldValue ?? 0) > 0 || (m.wetMassT ?? 0) > 0;
+            rows.fact_yield.push({
+              yield_key: surrogateKey(SOURCE, "yield", op.id),
+              operation_key: operationKey,
+              organization_key: organizationKey,
+              field_key: fieldKey,
+              polygon_key: null,
+              crop_season: op.cropSeason ? parseInt(op.cropSeason, 10) : null,
+              crop_name: op.cropName ?? null,
+              harvest_date: op.startDate ? op.startDate.slice(0, 10) : null,
+              area_ha: m.reportedAreaHa,
+              yield_value: m.yieldValue,
+              yield_unit: m.yieldUnit,
+              average_yield_value: m.averageYield,
+              average_yield_unit: m.averageYieldUnit,
+              wet_mass_value: m.wetMassT,
+              wet_mass_unit: m.wetMassT != null ? "t" : null,
+              average_wet_mass_value: m.averageWetMassTHa,
+              average_wet_mass_unit: m.averageWetMassTHa != null ? "t1ha-1" : null,
+              moisture_pct: m.moisturePct,
+              varieties: (m.varietyTotals || []).map((v) => ({
+                name: v.name ?? null,
+                area_ha: v.areaHa ?? null,
+              })),
+              has_usable_yield: usable,
+              ingested_at: now,
+              created_at: now,
+              updated_at: now,
+            });
+          }
+        }
+
+        await sleep(80);
+      }
+
+      await sleep(FIELD_OPS_BATCH_PAUSE_MS);
+    }
+
+    const archiver = require("archiver");
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="bq-load-${org.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.zip"`
+    );
+
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    archive.on("error", () => res.destroy());
+    archive.pipe(res);
+
+    // Newline-delimited JSON: BigQuery's expected format for JSON loads.
+    for (const [table, records] of Object.entries(rows)) {
+      const ndjson = records.map((r) => JSON.stringify(r)).join("\n");
+      archive.append(ndjson, { name: `${table}.jsonl` });
+    }
+
+    const loadCommands = Object.keys(rows)
+      .map(
+        (t) =>
+          `bq load --source_format=NEWLINE_DELIMITED_JSON --ignore_unknown_values \\\n` +
+          `  --location=me-west1 \\\n` +
+          `  agronegev-johndeere-dev:core.${t} ${t}.jsonl`
+      )
+      .join("\n\n");
+
+    archive.append(
+      [
+        `BigQuery load files — ${org.name} (${org.id})`,
+        `Generated: ${now}`,
+        `Fields included: ${fields.length} of ${fieldsResponse.total}`,
+        season ? `Season filter: ${season}` : `All seasons`,
+        ``,
+        `Row counts`,
+        ...Object.entries(rows).map(([t, r]) => `  ${t.padEnd(20)} ${r.length}`),
+        ``,
+        `Loading`,
+        ``,
+        `Upload the .jsonl files to Cloud Shell, then run:`,
+        ``,
+        loadCommands,
+        ``,
+        `Notes`,
+        `  Geometry is WKT with coordinates rounded to 6 decimal places.`,
+        `  BigQuery parses WKT into GEOGRAPHY on load.`,
+        ``,
+        `  Keys are deterministic hashes of source id, so re-running this`,
+        `  export and reloading updates rows rather than duplicating them.`,
+        `  The bq commands above append; use --replace to overwrite.`,
+        ``,
+        `  polygon_key on fact_operation and fact_yield is left null. Linking`,
+        `  an operation to the boundary version current on its date is a join`,
+        `  against dim_polygon validity ranges, and belongs in the warehouse`,
+        `  rather than the extractor.`,
+        ``,
+        `  Measurement units are unconverted. yield_unit is typically m3.`,
+      ].join("\n"),
+      { name: "README.txt" }
+    );
+
+    await archive.finalize();
+  })
+);
+
 // ---- GET /api/operations-geojson/:orgId -------------------------------
 // One polygon per operation, attributes attached. Load into QGIS, geojson.io,
 // or the map endpoint below.
