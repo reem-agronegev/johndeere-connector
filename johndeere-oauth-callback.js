@@ -957,13 +957,22 @@ function surrogateKey(...parts) {
 function geometryToWktRounded(geometry, dp = 6) {
   if (!geometry) return null;
   const r = (n) => Number(n.toFixed(dp));
-  const ring = (coords) => "(" + coords.map(([lon, lat]) => `${r(lon)} ${r(lat)}`).join(", ") + ")";
-  if (geometry.type === "Polygon") {
-    return "POLYGON(" + geometry.coordinates.map(ring).join(", ") + ")";
+  const ringWkt = (coords) => "(" + coords.map(([lon, lat]) => `${r(lon)} ${r(lat)}`).join(", ") + ")";
+
+  // Regroup by containment before writing: the incoming ring order
+  // reflects Deere's labels, which BigQuery does not accept as-is.
+  const polygons =
+    geometry.type === "Polygon" ? [geometry.coordinates] : geometry.coordinates;
+
+  const regrouped = polygons.flatMap((rings) => groupRingsByContainment(rings));
+  if (regrouped.length === 0) return null;
+
+  if (regrouped.length === 1) {
+    return "POLYGON(" + regrouped[0].map(ringWkt).join(", ") + ")";
   }
   return (
     "MULTIPOLYGON(" +
-    geometry.coordinates.map((poly) => "(" + poly.map(ring).join(", ") + ")").join(", ") +
+    regrouped.map((rings) => "(" + rings.map(ringWkt).join(", ") + ")").join(", ") +
     ")"
   );
 }
@@ -971,6 +980,60 @@ function geometryToWktRounded(geometry, dp = 6) {
 function geometryHash(geometry) {
   const wkt = geometryToWktRounded(geometry);
   return wkt ? crypto.createHash("sha256").update(wkt).digest("hex") : null;
+}
+
+// BigQuery NUMERIC holds 9 decimal places; a raw JavaScript double
+// carries more and the load is rejected outright ("Invalid NUMERIC
+// value"). Areas and rates are rounded before export. Six places is far
+// beyond any meaningful precision for hectares or application rates.
+// BigQuery GEOGRAPHY requires a polygon's first ring to be the outer
+// shell, with any enclosed rings following as holes. Deere does not
+// always label them that way: a ring geometrically inside another can
+// still come back marked "exterior", which BigQuery rejects with
+// "Polygon's first loop must be shell".
+//
+// Rather than trust the label, containment is tested directly. Rings are
+// grouped so each shell carries the rings that sit inside it.
+function pointInRing(point, ring) {
+  const [x, y] = point;
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i];
+    const [xj, yj] = ring[j];
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+// A ring is treated as enclosed when its first vertex falls inside the
+// candidate. Field boundaries do not self-intersect, so one vertex is a
+// reliable test here.
+function ringIsInside(inner, outer) {
+  return inner.length > 0 && pointInRing(inner[0], outer);
+}
+
+function groupRingsByContainment(rings) {
+  if (rings.length <= 1) return rings.map((r) => [r]);
+
+  // Largest first, so a shell is always considered before its holes.
+  const sorted = [...rings].sort((a, b) => ringAreaSqMeters(b) - ringAreaSqMeters(a));
+  const groups = [];
+
+  for (const ring of sorted) {
+    const shell = groups.find((g) => ringIsInside(ring, g[0]));
+    if (shell) shell.push(ring);
+    else groups.push([ring]);
+  }
+
+  return groups;
+}
+
+function num(v, dp = 6) {
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? Number(n.toFixed(dp)) : null;
 }
 
 // ---- GET /api/bigquery-export/:orgId ---------------------------------
@@ -1093,9 +1156,9 @@ app.get(
               geom: geometryToWktRounded(geom),
               geometry_hash: geometryHash(geom),
               centroid: b.centroid ? `POINT(${b.centroid.lon} ${b.centroid.lat})` : null,
-              area_ha_reported: b.area?.valueAsDouble ?? null,
-              area_ha_computed: geom ? geometryAreaHa(geom) : null,
-              workable_area_ha: b.workableArea?.valueAsDouble ?? null,
+              area_ha_reported: num(b.area?.valueAsDouble),
+              area_ha_computed: num(geom ? geometryAreaHa(geom) : null),
+              workable_area_ha: num(b.workableArea?.valueAsDouble),
               boundary_name: b.name ?? null,
               source_type: b.sourceType ?? null,
               is_irrigated: b.irrigated ?? null,
@@ -1139,8 +1202,8 @@ app.get(
           end_date: op.endDate ?? null,
           geom: built.type === "Feature" ? geometryToWktRounded(built.geometry) : null,
           geometry_source: p.geometrySource,
-          area_ha_computed: p.computedAreaHa,
-          area_ha_reported: p.reportedAreaHa,
+          area_ha_computed: num(p.computedAreaHa),
+          area_ha_reported: num(p.reportedAreaHa),
           has_real_coverage: (p.computedAreaHa ?? 0) >= 0.1,
           machines: (op.fieldOperationMachines || []).map((m) => ({
             name: m.name ?? null,
@@ -1151,12 +1214,12 @@ app.get(
             name: prod.name ?? null,
             product_type: prod.productType ?? null,
             is_tank_mix: prod.tankMix ?? null,
-            rate_value: prod.rate?.value ?? null,
+            rate_value: num(prod.rate?.value),
             rate_unit: prod.rate?.unitId ?? null,
             components: (prod.components || []).map((c) => ({
               name: c.name ?? null,
               product_type: c.productType ?? null,
-              rate_value: c.rate?.value ?? null,
+              rate_value: num(c.rate?.value),
               rate_unit: c.rate?.unitId ?? null,
             })),
           })),
@@ -1187,19 +1250,19 @@ app.get(
               crop_season: op.cropSeason ? parseInt(op.cropSeason, 10) : null,
               crop_name: op.cropName ?? null,
               harvest_date: op.startDate ? op.startDate.slice(0, 10) : null,
-              area_ha: m.reportedAreaHa,
-              yield_value: m.yieldValue,
+              area_ha: num(m.reportedAreaHa),
+              yield_value: num(m.yieldValue),
               yield_unit: m.yieldUnit,
-              average_yield_value: m.averageYield,
+              average_yield_value: num(m.averageYield),
               average_yield_unit: m.averageYieldUnit,
-              wet_mass_value: m.wetMassT,
+              wet_mass_value: num(m.wetMassT),
               wet_mass_unit: m.wetMassT != null ? "t" : null,
-              average_wet_mass_value: m.averageWetMassTHa,
+              average_wet_mass_value: num(m.averageWetMassTHa),
               average_wet_mass_unit: m.averageWetMassTHa != null ? "t1ha-1" : null,
-              moisture_pct: m.moisturePct,
+              moisture_pct: num(m.moisturePct),
               varieties: (m.varietyTotals || []).map((v) => ({
                 name: v.name ?? null,
-                area_ha: v.areaHa ?? null,
+                area_ha: num(v.areaHa),
               })),
               has_usable_yield: usable,
               ingested_at: now,
